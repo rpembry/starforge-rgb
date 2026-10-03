@@ -1,0 +1,9 @@
+# Read-only subscriber contract outline (issue #21)
+
+This is a contract design note; PR #20 and this branch do not expose a subscription endpoint. Consumers must read a projection of the coordinator's canonical state, not run another event engine or receive device actions.
+
+Proposed v1 projection: `schema_version`, epoch ID, monotonic revision, stable event and subscription IDs, semantic cue/status/severity, source confidence, occurred/observed/expiry times, explicit freshness, and a channel outcome map keyed by capability (`text`, `rgb`, `audio`, future `pushover`, etc.). Outcomes distinguish planned, suppressed, adapter-accepted, failed, unknown and expired; none assert user perception. Optional text requires a separate authorized scope and redaction policy. Theme assets, device mappings, credentials and raw producer metadata stay out of the projection.
+
+Snapshot and stream must share one revision boundary. A client requests an authorized snapshot, then deltas after its cursor; a bounded replay log reports gaps and epoch resets so clients resnapshot. Expiry and cancellation emit retractions. At-least-once delivery, duplicate IDs, out-of-order arrival and offline resume cannot resurrect an expired cue or imply complete history after truncation. Server-side source/topic/resource authorization is enforced before projection; client filters and checkbox settings are preferences, not access control. A subscriber credential grants no publish, cancellation, hardware, global policy or provider-routing authority.
+
+The first transport should be restricted local read-only access. A later browser-compatible bridge requires separately reviewed authentication and CORS/HTTPS choices; it must never expose the privileged control socket. Pushover routing (#24) remains an independent policy-controlled output channel with separate credentials and delivery-state reporting.

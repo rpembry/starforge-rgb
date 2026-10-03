@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "minimal",
+  "version": "0.1.0",
+  "author": "Starforge contributors",
+  "license": "MIT",
+  "provenance": "Original example data for this project",
+  "capabilities": ["text", "rgb"],
+  "assets": {},
+  "cues": {
+    "job.completed": {
+      "text": {"prefix": "Done: "},
+      "rgb": {"zones": ["primary"], "color": [0, 48, 16], "level": 0.2}
+    }
+  }
+}
