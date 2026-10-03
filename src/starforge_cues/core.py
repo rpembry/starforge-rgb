@@ -191,6 +191,34 @@ class Coordinator:
             changed = self._sync_policy()
             return state if state["result"] != "unchanged" else changed
 
+    def set_host_configuration(self, generation: int, cue_id: str | None,
+                               text: str | None, policy: QuietPolicy) -> dict:
+        """Apply a validated host baseline and quiet policy under one lock."""
+        if not isinstance(policy, QuietPolicy):
+            raise ValueError("invalid quiet policy")
+        with self._lock:
+            if type(generation) is not int or generation <= self._baseline_generation:
+                raise ValueError("baseline generation must increase")
+            if cue_id is not None and (not isinstance(cue_id, str) or
+                                       not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}", cue_id)):
+                raise ValueError("invalid baseline cue")
+            if text is not None and (not isinstance(text, str) or len(text) > 280 or
+                                     any(ord(char) < 32 and char not in "\n\t" for char in text)):
+                raise ValueError("invalid baseline text")
+            if cue_id is None and text is not None:
+                raise ValueError("baseline text requires a cue")
+            self._prune(self.monotonic_clock())
+            self.policy = policy
+            self._baseline_generation = generation
+            self._baseline_plan = None if cue_id is None else {
+                "operation": "restore", "cue_id": cue_id, "status": "baseline",
+                "severity": "info", "source_id": "local.baseline", "confidence": "known",
+                "subject_id": None, "text": text, "expires_at": None,
+                "baseline": cue_id, "baseline_generation": generation}
+            state = self._reconcile(suppress_audio_restore=self._audio_resuming())
+            changed = self._sync_policy()
+            return state if state["result"] != "unchanged" else changed
+
     def _audio_resuming(self) -> bool:
         return not self._last_permitted["audio"] and self.policy.permits("audio", self.clock())
 
