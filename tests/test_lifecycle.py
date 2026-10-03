@@ -18,6 +18,51 @@ def event(at: float, **changes):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_decision_refresh_updates_text_without_replaying_sound(self):
+        clock = [NOW]
+        text, audio = FakeSink(), FakeSink()
+        core = Coordinator({"text": text, "audio": audio}, clock=lambda: clock[0])
+        first = core.handle(event(clock[0], event_id="decision-1", idempotency_key="decision-1",
+                                  cue_id="agent.decision", subject_id="agent-run-1",
+                                  status="needs_attention", text="Choose an option"))
+        self.assertEqual(first["channels"]["audio"], "accepted")
+        audio_count = len(audio.calls)
+        clock[0] += 20
+        refreshed = core.handle(event(clock[0], event_id="decision-2", idempotency_key="decision-2",
+                                      cue_id="agent.decision.updated", subject_id="agent-run-1",
+                                      status="needs_attention", text="Choose an updated option"))
+        self.assertEqual(refreshed["channels"]["audio"], "suppressed")
+        self.assertEqual(len(audio.calls), audio_count)
+        self.assertEqual(text.state["text"]["text"], "Choose an updated option")
+        self.assertEqual(refreshed["plan"]["status"], "needs_attention")
+        clock[0] += 20
+        resolved = core.handle(event(clock[0], event_id="decision-done", idempotency_key="decision-done",
+                                     cue_id="agent.completed", subject_id="agent-run-1",
+                                     status="succeeded", text="Decision resolved"))
+        self.assertEqual(resolved["channels"]["audio"], "accepted")
+        self.assertEqual(len(audio.calls), audio_count + 1)
+
+    def test_ambiguous_first_decision_sound_is_not_retried_on_refresh(self):
+        class AmbiguousAudio(FakeSink):
+            def dispatch(self, channel, plan):
+                self.calls.append((channel, dict(plan)))
+                return "unknown"
+
+        clock = [NOW]
+        audio = AmbiguousAudio()
+        core = Coordinator({"audio": audio}, clock=lambda: clock[0])
+        first = core.handle(event(clock[0], event_id="first", idempotency_key="first",
+                                  cue_id="agent.decision", subject_id="agent-run-1",
+                                  status="needs_attention"))
+        self.assertEqual(first["channels"]["audio"], "unknown")
+        first_count = len(audio.calls)
+        clock[0] += 10
+        refreshed = core.handle(event(clock[0], event_id="renew", idempotency_key="renew",
+                                      cue_id="agent.decision", subject_id="agent-run-1",
+                                      status="needs_attention"))
+        self.assertEqual(refreshed["channels"]["audio"], "suppressed")
+        self.assertEqual(len(audio.calls), first_count)
+
     def test_renewal_horizon_requires_new_subject_after_cap(self):
         clock = [NOW]
         rgb = FakeSink()

@@ -340,9 +340,16 @@ class Coordinator:
         # An ambiguous receipt must not be retried automatically.
         return "unknown"
 
-    def _dispatch(self, plan: dict, suppress_audio_restore: bool = False) -> dict[str, str]:
+    def _dispatch(self, plan: dict, suppress_audio_restore: bool = False,
+                  suppress_audio_cue: bool = False) -> dict[str, str]:
         results = {}
         for channel in CHANNELS:
+            if channel == "audio" and plan["operation"] == "cue" and suppress_audio_cue:
+                # A refreshed decision card changes its visible state, but its
+                # first sound is never replayed (including after an ambiguous
+                # initial receipt). Leave any current one-shot playback alone.
+                results[channel] = "suppressed"
+                continue
             if channel == "audio" and plan["operation"] == "restore" and suppress_audio_restore:
                 self._desired[channel] = {"operation": "clear", "baseline": None, "text": None}
                 results[channel] = "suppressed"
@@ -473,6 +480,9 @@ class Coordinator:
             reconciliation = self._reconcile()
             return {"result": "accepted", "reason": None, "plan": reconciliation.get("plan"),
                     "channels": reconciliation["channels"]}
+        existing = self._leases.get(lease_key)
+        decision_refresh = (existing is not None and event.subject_id is not None and
+                            existing.plan["status"] == event.status == "needs_attention")
         self._sequence += 1
         plan = {"operation": "cue", "cue_id": event.cue_id, "status": event.status,
                 "severity": event.severity, "source_id": event.source_id,
@@ -487,4 +497,4 @@ class Coordinator:
                     "channels": {channel: "preempted" for channel in CHANNELS}}
         self._active_key = lease_key
         return {"result": "accepted", "reason": None, "plan": plan,
-                "channels": self._dispatch(plan)}
+                "channels": self._dispatch(plan, suppress_audio_cue=decision_refresh)}
