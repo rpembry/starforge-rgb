@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import socketserver
 import stat
+from threading import BoundedSemaphore
 
 from .contract import ContractError, CueEvent, MAX_BYTES
 from .core import Coordinator, FakeSink, CHANNELS
@@ -30,28 +31,74 @@ def _safe_directory(path: Path) -> None:
 
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        raw = self.rfile.readline(MAX_BYTES + 2)
         try:
+            self.request.settimeout(2)
+            raw = self.rfile.readline(MAX_BYTES + 2)
             if not raw.endswith(b"\n") or len(raw) > MAX_BYTES + 1:
                 raise ContractError("event: too large or unterminated")
             event = CueEvent.from_json(raw[:-1])
             response = self.server.coordinator.handle(event)
         except ContractError as exc:
             response = {"result": "rejected", "reason": str(exc), "channels": {}}
-        self.wfile.write(json.dumps(response, sort_keys=True).encode() + b"\n")
+        except (OSError, TimeoutError):
+            return
+        try:
+            self.wfile.write(json.dumps(response, sort_keys=True).encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
 
 
-class LocalServer(socketserver.UnixStreamServer):
+class LocalServer(socketserver.ThreadingMixIn, getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 16
+
     def __init__(self, path: Path, coordinator: Coordinator | None = None):
-        if not hasattr(socket, "AF_UNIX"):
-            raise RuntimeError("Unix domain sockets are unavailable on this platform")
+        if not hasattr(socket, "AF_UNIX") or not hasattr(os, "getuid"):
+            raise RuntimeError("restricted Unix socket hosting is unavailable on this platform")
         path = Path(path)
         _safe_directory(path.parent)
         if path.exists() or path.is_symlink():
             raise RuntimeError("socket path already exists; stop the other server first")
         self.coordinator = coordinator or Coordinator({channel: FakeSink() for channel in CHANNELS})
+        self._slots = BoundedSemaphore(16)
         super().__init__(str(path), _Handler)
         os.chmod(path, 0o600)
+        info = path.lstat()
+        self._socket_identity = (info.st_dev, info.st_ino)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def service_actions(self):
+        self.coordinator.tick()
+
+    def server_close(self):
+        super().server_close()
+        path = Path(self.server_address)
+        try:
+            info = path.lstat()
+            if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._socket_identity:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def close(self):
+        """Explicitly close and remove only this server's own socket inode."""
+        self.server_close()
 
 
 def submit(path: Path, raw: bytes) -> dict:

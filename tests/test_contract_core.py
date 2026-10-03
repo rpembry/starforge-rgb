@@ -1,5 +1,8 @@
 import json
+from contextlib import redirect_stderr
+import io
 from pathlib import Path
+import tempfile
 import unittest
 
 from starforge_cues import ContractError, Coordinator, CueEvent, FakeSink, QuietPolicy, SourceCapabilities
@@ -32,6 +35,19 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             CueEvent.from_json(b'{"version":1,"version":1}')
 
+    def test_cli_diagnostic_redacts_untrusted_key(self):
+        from starforge_cues.cli import main
+        attacker_key = "private-message-" + "x" * 2000
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid.json"
+            path.write_text(json.dumps({**FIXTURE, attacker_key: "private value"}))
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic):
+                self.assertEqual(main(["dry-run", "--file", str(path)]), 2)
+        self.assertNotIn(attacker_key, diagnostic.getvalue())
+        self.assertNotIn("private value", diagnostic.getvalue())
+        self.assertLess(len(diagnostic.getvalue()), 100)
+
 
 class PolicyTests(unittest.TestCase):
     def make_core(self, **kw):
@@ -42,7 +58,7 @@ class PolicyTests(unittest.TestCase):
         core, _ = self.make_core()
         self.assertEqual(core.handle(event())["result"], "accepted")
         self.assertEqual(core.handle(event())["reason"], "duplicate")
-        self.assertEqual(core.handle(event(idempotency_key="other"))["reason"], "duplicate")
+        self.assertEqual(core.handle(event(idempotency_key="other"))["reason"], "replay_conflict")
         self.assertEqual(core.handle(event(occurred_at="2026-10-02T23:50:00Z"))["reason"], "stale")
 
     def test_quiet_independent_failures_and_absent_text(self):
@@ -79,6 +95,65 @@ class PolicyTests(unittest.TestCase):
         core = Coordinator(clock=lambda: NOW, sources={"synthetic.build": caps})
         self.assertEqual(core.handle(event())["reason"], "source_capability")
         self.assertEqual(core.handle(event(status="unknown", subject_id=None, text=None))["result"], "accepted")
+
+    def test_replay_body_conflict_and_freshness(self):
+        core, _ = self.make_core()
+        self.assertEqual(core.handle(event())["result"], "accepted")
+        self.assertEqual(core.handle(event(event_id="changed"))["reason"], "replay_conflict")
+        self.assertEqual(core.handle(event(text="Different synthetic text"))["reason"], "replay_conflict")
+        with self.assertRaises(ContractError):
+            event(observed_at="2020-01-01T00:00:00Z")
+
+    def test_restore_and_clear_are_dispatched(self):
+        clock = [NOW]
+        sinks = {name: FakeSink() for name in ("text", "rgb", "audio")}
+        core = Coordinator(sinks, clock=lambda: clock[0])
+        low = event(event_id="low", idempotency_key="low", subject_id="low", cue_id="job.progress")
+        urgent = event(event_id="urgent", idempotency_key="urgent", subject_id="urgent", severity="critical")
+        core.handle(low)
+        core.handle(urgent)
+        result = core.handle(event(event_id="cancel", idempotency_key="cancel", subject_id="urgent", status="cancelled"))
+        self.assertEqual(result["plan"]["operation"], "restore")
+        self.assertEqual(sinks["rgb"].state["rgb"]["cue_id"], "job.progress")
+        clock[0] += 241
+        tick = core.tick()
+        self.assertEqual(tick["plan"]["operation"], "clear")
+        self.assertIsNone(sinks["rgb"].state["rgb"])
+
+    def test_expiry_clear_runs_during_quiet_policy(self):
+        clock = [NOW]
+        rgb = FakeSink()
+        core = Coordinator({"rgb": rgb}, clock=lambda: clock[0])
+        core.handle(event())
+        core.policy = QuietPolicy(quiet=True)
+        clock[0] += 241
+        self.assertEqual(core.tick()["channels"]["rgb"], "accepted")
+        self.assertIsNone(rgb.state["rgb"])
+
+    def test_cancellation_admitted_at_capacity(self):
+        core, sinks = self.make_core()
+        core.handle(event())
+        original = event()
+        for i in range(4095):
+            key = ("synthetic.build", f"filled{i}")
+            core._seen[key] = (NOW + 240, original)
+        core._rate = {f"source{i}": [NOW] for i in range(256)}
+        result = core.handle(event(event_id="cancel", idempotency_key="cancel",
+                                   subject_id="example-job", status="cancelled"))
+        self.assertEqual(result["result"], "accepted")
+        self.assertEqual(result["plan"]["operation"], "clear")
+        self.assertIsNone(sinks["rgb"].state["rgb"])
+        self.assertLessEqual(len(core._seen), 4096)
+
+    def test_redacted_unknown_fields_and_metadata(self):
+        attacker_key = "x" * 2000
+        with self.assertRaises(ContractError) as captured:
+            event(**{attacker_key: "secret"})
+        self.assertNotIn(attacker_key, str(captured.exception))
+        self.assertLess(len(str(captured.exception)), 100)
+        for key in ("device", "command", "rgb", "path"):
+            with self.assertRaises(ContractError):
+                event(metadata={key: "arbitrary"})
 
 
 if __name__ == "__main__":

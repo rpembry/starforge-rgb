@@ -40,7 +40,6 @@ def main(argv: list[str] | None = None) -> int:
                     host.serve_forever()
                 except KeyboardInterrupt:
                     pass
-            path.unlink(missing_ok=True)
             return 0
         raw = _raw(args.file)
         if args.command == "dry-run":

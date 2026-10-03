@@ -63,8 +63,8 @@ class CueEvent:
             raise ContractError("event: expected object")
         if (missing := _REQUIRED - value.keys()):
             raise ContractError(f"missing fields: {', '.join(sorted(missing))}")
-        if (unknown := value.keys() - _FIELDS):
-            raise ContractError(f"unknown fields: {', '.join(sorted(unknown))}")
+        if value.keys() - _FIELDS:
+            raise ContractError("event: unknown field")
         if type(value["version"]) is not int or value["version"] != 1:
             raise ContractError("version: unsupported")
         ids = {name: _identifier(value[name], name) for name in
@@ -91,10 +91,16 @@ class CueEvent:
             raise ContractError("metadata: expected at most 8 keys")
         for key, item in metadata.items():
             _identifier(key, "metadata key")
+            if key not in {"label", "phase", "group", "count"}:
+                raise ContractError("metadata: unsupported key")
             if not isinstance(item, (str, int, bool)) or (isinstance(item, str) and len(item) > 80) or (type(item) is int and abs(item) > 1_000_000):
                 raise ContractError("metadata: invalid value")
         occurred = _time(value["occurred_at"], "occurred_at")
         observed = _time(value["observed_at"], "observed_at")
+        if observed < occurred:
+            raise ContractError("observed_at: before occurred_at")
+        if status == "cancelled" and ids["subject_id"] is None:
+            raise ContractError("subject_id: required for cancellation")
         return cls(1, ids["event_id"], ids["cue_id"], ids["source_id"], confidence,
                    ids["subject_id"], ids["correlation_id"], ids["origin_id"], occurred,
                    observed, status, severity, ttl, ids["idempotency_key"], body, dict(metadata))
