@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "event_id": "demo-1",
+  "cue_id": "job.completed",
+  "source_id": "synthetic.build",
+  "confidence": "known",
+  "subject_id": "example-job",
+  "correlation_id": "example-flow",
+  "origin_id": "demo-cli",
+  "occurred_at": "2026-10-03T00:00:00Z",
+  "observed_at": "2026-10-03T00:00:00Z",
+  "status": "succeeded",
+  "severity": "info",
+  "ttl_ms": 300000,
+  "idempotency_key": "demo-1",
+  "text": "Synthetic job completed."
+}

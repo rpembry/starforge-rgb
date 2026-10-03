@@ -3,5 +3,17 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/pyproject.toml
+!/src/
+!/src/starforge_cues/
+!/src/starforge_cues/*.py
+!/tests/
+!/tests/test_*.py
+!/examples/
+!/examples/*.json
+!/docs/
+!/docs/*.md
+!/docs/adr/
+!/docs/adr/*.md
 
 # Add exact paths here as source, tests, and documentation are created.
