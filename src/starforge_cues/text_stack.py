@@ -80,7 +80,10 @@ class TextStackModel:
 
         entries = [entry for entry in snapshot["entries"]
                    if entry["source_id"] not in self.excluded_sources]
-        active_revisions = {(entry["entry_id"], entry["revision"]) for entry in entries}
+        # The detailed projection is capped at 32, while this identity index
+        # covers every active lease (bounded by the coordinator's 4096 cap).
+        # Missing detail is not authoritative evidence of cancellation/expiry.
+        active_revisions = set(map(tuple, snapshot["active_revisions"]))
         self._dismissed.intersection_update(active_revisions)
         self._seen_history = {key: source for key, source in self._seen_history.items()
                               if key in active_revisions}

@@ -127,7 +127,8 @@ class TextStackTests(unittest.TestCase):
                                                            elapsed=clock[0])["rows"][0]["label"])
         core.set_policy(QuietPolicy(dnd=True))
         self.assertEqual(core.text_snapshot(), {"quiet": True, "total": 0,
-                                                "source_totals": {}, "entries": []})
+                                                "source_totals": {},
+                                                "active_revisions": [], "entries": []})
         hidden = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
         self.assertTrue(hidden["hidden"])
         self.assertEqual(hidden["history"], [])
@@ -177,6 +178,7 @@ class TextStackTests(unittest.TestCase):
         snapshot = core.text_snapshot()
         self.assertEqual(snapshot["total"], 40)
         self.assertEqual(len(snapshot["entries"]), 32)
+        self.assertEqual(len(snapshot["active_revisions"]), 40)
         view = TextStackModel().refresh(snapshot, unlocked=True, elapsed=0)
         self.assertEqual(len(view["rows"]), 8)
         self.assertEqual(view["overflow"], 24)
@@ -185,6 +187,60 @@ class TextStackTests(unittest.TestCase):
         filtered = excluded.refresh(snapshot, unlocked=True, elapsed=0)
         self.assertEqual(filtered["truncated"], 6)
         self.assertTrue(all(item["source_id"] != "source-0" for item in filtered["history"]))
+
+    def test_truncated_projection_preserves_dismissal_and_history_until_real_expiry(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0])
+        model = TextStackModel()
+        core.handle(event(clock[0], event_id="low", idempotency_key="low",
+                          subject_id="low", source_id="low.source", severity="info"))
+        first = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
+        model.dismiss(first["rows"][0]["row_id"])
+        for index in range(32):
+            core.handle(event(clock[0], event_id=f"critical-{index}",
+                              idempotency_key=f"critical-{index}",
+                              subject_id=f"critical-{index}",
+                              source_id=f"critical.source-{index}",
+                              severity="critical", ttl_ms=1))
+        truncated = core.text_snapshot()
+        self.assertEqual(truncated["total"], 33)
+        self.assertEqual(len(truncated["entries"]), 32)
+        self.assertEqual(len(truncated["active_revisions"]), 33)
+        model.refresh(truncated, unlocked=True, elapsed=clock[0])
+        self.assertEqual(len(model._dismissed), 1)
+        clock[0] += 0.002
+        core.tick()
+        returned = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
+        self.assertEqual(returned["rows"], [])
+        self.assertEqual(sum(item["entry_id"].endswith("subject:low")
+                             for item in returned["history"]), 1)
+
+    def test_identity_metadata_stays_bounded_under_truncated_churn(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0])
+        model = TextStackModel()
+        core.handle(event(clock[0], event_id="low", idempotency_key="low",
+                          subject_id="low", source_id="low.source"))
+        first = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
+        model.dismiss(first["rows"][0]["row_id"])
+        for wave in range(20):
+            for index in range(32):
+                number = wave * 32 + index
+                core.handle(event(clock[0], event_id=f"brief-{number}",
+                                  idempotency_key=f"brief-{number}",
+                                  subject_id=f"brief-{number}",
+                                  source_id=f"source-{number % 255}",
+                                  severity="critical", ttl_ms=1))
+            snapshot = core.text_snapshot()
+            self.assertEqual(snapshot["total"], 33)
+            model.refresh(snapshot, unlocked=True, elapsed=clock[0])
+            self.assertLessEqual(len(model._dismissed), 1)
+            self.assertLessEqual(len(model._seen_history), 33)
+            self.assertLessEqual(len(model._history), 50)
+            clock[0] += 0.002
+            core.tick()
+        self.assertEqual(model.refresh(core.text_snapshot(), unlocked=True,
+                                       elapsed=clock[0])["rows"], [])
 
     def test_changing_exclusions_purges_existing_history(self):
         core = Coordinator(clock=lambda: NOW)
