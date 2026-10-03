@@ -11,6 +11,12 @@ from .contract import CueEvent
 CHANNELS = ("text", "rgb", "audio")
 
 
+def _valid_baseline_text(text: str | None) -> bool:
+    return (text is None or
+            (isinstance(text, str) and len(text) <= 280 and
+             all(char.isprintable() or char in "\n\t" for char in text)))
+
+
 class Sink(Protocol):
     capabilities: frozenset[str]
 
@@ -124,6 +130,7 @@ class Coordinator:
         self._active_key: tuple[str, str] | None = None
         self._sequence = 0
         self._baseline_generation = 0
+        self._allow_initial_host_generation = False
         self._baseline_plan: dict | None = None
         self._emitted_baseline_generation = -1
         self._last_permitted = {channel: True for channel in CHANNELS}
@@ -136,13 +143,16 @@ class Coordinator:
 
     @classmethod
     def recover_baseline(cls, generation: int, cue_id: str | None, text: str | None = None,
-                         **options) -> "Coordinator":
+                         *, unconfigured_host: bool = False, **options) -> "Coordinator":
         """Start a fresh process from host-supplied current settings, never old leases."""
         coordinator = cls(**options)
         audio_clear = None
         if cue_id is not None:
             audio_clear = coordinator._send("audio", {"operation": "clear", "baseline": None, "text": None})
         dispatched = coordinator.set_baseline(generation, cue_id, text, suppress_audio_restore=True)
+        # A synthetic safe-default generation is not a configured generation.
+        # Permit one first real host reload at the same generation, then close it.
+        coordinator._allow_initial_host_generation = unconfigured_host
         coordinator.recovery_result = {"previous_output": "unknown",
                                        "audio_clear": audio_clear,
                                        "baseline_dispatch": dispatched}
@@ -172,10 +182,10 @@ class Coordinator:
             if cue_id is not None and (not isinstance(cue_id, str) or
                                        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}", cue_id)):
                 raise ValueError("invalid baseline cue")
-            if text is not None and (not isinstance(text, str) or len(text) > 280 or
-                                     any(ord(char) < 32 and char not in "\n\t" for char in text)):
+            if not _valid_baseline_text(text):
                 raise ValueError("invalid baseline text")
             self._baseline_generation = generation
+            self._allow_initial_host_generation = False
             self._baseline_plan = None if cue_id is None else {
                 "operation": "restore", "cue_id": cue_id, "status": "baseline",
                 "severity": "info", "source_id": "local.baseline", "confidence": "known",
@@ -197,19 +207,24 @@ class Coordinator:
         if not isinstance(policy, QuietPolicy):
             raise ValueError("invalid quiet policy")
         with self._lock:
-            if type(generation) is not int or generation <= self._baseline_generation:
+            first_host_generation = (self._allow_initial_host_generation and
+                                     generation == self._baseline_generation)
+            if (type(generation) is not int or
+                    (generation <= self._baseline_generation and not first_host_generation)):
                 raise ValueError("baseline generation must increase")
             if cue_id is not None and (not isinstance(cue_id, str) or
                                        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}", cue_id)):
                 raise ValueError("invalid baseline cue")
-            if text is not None and (not isinstance(text, str) or len(text) > 280 or
-                                     any(ord(char) < 32 and char not in "\n\t" for char in text)):
+            if not _valid_baseline_text(text):
                 raise ValueError("invalid baseline text")
             if cue_id is None and text is not None:
                 raise ValueError("baseline text requires a cue")
             self._prune(self.monotonic_clock())
             self.policy = policy
             self._baseline_generation = generation
+            self._allow_initial_host_generation = False
+            if first_host_generation:
+                self._emitted_baseline_generation = -1
             self._baseline_plan = None if cue_id is None else {
                 "operation": "restore", "cue_id": cue_id, "status": "baseline",
                 "severity": "info", "source_id": "local.baseline", "confidence": "known",

@@ -12,7 +12,7 @@ import re
 import stat
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .core import Coordinator, QuietPolicy, QuietWindow
+from .core import Coordinator, QuietPolicy, QuietWindow, _valid_baseline_text
 
 MAX_CONFIG_BYTES = 4096
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}\Z")
@@ -80,8 +80,7 @@ def parse_host_config(raw: bytes) -> HostConfig:
         raise ConfigError("invalid baseline generation")
     if cue_id is not None and (not isinstance(cue_id, str) or not _IDENTIFIER.fullmatch(cue_id)):
         raise ConfigError("invalid baseline cue")
-    if text is not None and (cue_id is None or not isinstance(text, str) or len(text) > 280 or
-                             any(ord(char) < 32 and char not in "\n\t" for char in text)):
+    if not _valid_baseline_text(text) or (cue_id is None and text is not None):
         raise ConfigError("invalid baseline text")
     quiet = _object(data["quiet"], {"manual", "dnd", "muted", "timezone", "windows"})
     muted = quiet["muted"]
@@ -174,5 +173,6 @@ def recover_private_config(path: str | os.PathLike[str], **coordinator_options) 
         status = "missing" if str(exc) == "private configuration missing" else "invalid"
     coordinator = Coordinator.recover_baseline(config.generation, config.cue_id,
                                                config.text, policy=config.policy,
+                                               unconfigured_host=status != "loaded",
                                                **coordinator_options)
     return coordinator, status

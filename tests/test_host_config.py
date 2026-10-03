@@ -60,10 +60,19 @@ class ParseTests(unittest.TestCase):
         item = document()
         item["baseline"]["text"] = "\x00secret"
         bad.append(encoded(item))
+        for unsafe_text in ("label\x7f", "right\u202eto-left", "isolate\u2066"):
+            item = document()
+            item["baseline"]["text"] = unsafe_text
+            bad.append(encoded(item))
         bad.extend((b'{"version":1,"version":1}', b"{", b" " * 4097))
         for raw in bad:
             with self.subTest(raw=raw[:80]), self.assertRaises(ConfigError):
                 parse_host_config(raw)
+        core = Coordinator(clock=lambda: NOW)
+        for unsafe_text in ("label\x7f", "right\u202eto-left"):
+            with self.subTest(unsafe_text=unsafe_text), self.assertRaises(ValueError):
+                core.set_baseline(1, "ambient.example", unsafe_text)
+        core.set_baseline(1, "ambient.example", "A plain label\nwith a line break")
 
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "POSIX private files required")
@@ -152,6 +161,28 @@ class PrivateFileTests(unittest.TestCase):
         self.path.unlink()
         self.assertEqual(reload_private_config(self.path, loaded)["reason"], "invalid_config")
         self.assertEqual(loaded._baseline_generation, 4)
+
+    def test_first_valid_generation_one_after_fail_closed_startup(self):
+        for initial in ("missing", "invalid"):
+            with self.subTest(initial=initial):
+                if initial == "invalid":
+                    self.write(document(), mode=0o644)
+                else:
+                    self.path.unlink(missing_ok=True)
+                rgb = FakeSink()
+                core, status = recover_private_config(self.path, sinks={"rgb": rgb}, clock=lambda: NOW)
+                self.assertEqual(status, initial)
+                self.assertTrue(core.policy.quiet)
+                self.assertIsNone(rgb.state["rgb"])
+
+                self.write(document(1, "ambient.first", windows=False))
+                self.assertEqual(reload_private_config(self.path, core)["result"], "loaded")
+                self.assertFalse(core.policy.quiet)
+                self.assertEqual(rgb.state["rgb"]["cue_id"], "ambient.first")
+                self.assertEqual(reload_private_config(self.path, core)["reason"], "invalid_config")
+                self.write(document(2, "ambient.next", windows=False))
+                self.assertEqual(reload_private_config(self.path, core)["result"], "loaded")
+                self.assertEqual(rgb.state["rgb"]["cue_id"], "ambient.next")
 
 
 if __name__ == "__main__":
