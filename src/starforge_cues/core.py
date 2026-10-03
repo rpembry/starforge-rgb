@@ -117,8 +117,9 @@ class Coordinator:
         try:
             outcome = sink.dispatch(channel, dict(plan))
         except Exception:
-            # A cue sound may have played before an adapter error; never retry it.
-            retryable = plan["operation"] != "cue" or channel != "audio"
+            # A cue or restore sound may have played before an adapter error.
+            # Only a clear is safe to retry on the audio channel.
+            retryable = channel != "audio" or plan["operation"] == "clear"
             if retryable and prior_attempts + 1 < 3:
                 self._pending[channel] = (plan, prior_attempts + 1)
             else:

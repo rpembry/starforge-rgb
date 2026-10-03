@@ -180,6 +180,23 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(core.tick()["result"], "unchanged")
         self.assertEqual(len(rgb.calls), count)
 
+    def test_failed_audio_restore_is_not_replayed(self):
+        sinks = {name: FakeSink() for name in ("text", "rgb", "audio")}
+        core = Coordinator(sinks, clock=lambda: NOW)
+        core.handle(event(event_id="low", idempotency_key="low", subject_id="low",
+                          cue_id="job.progress"))
+        core.handle(event(event_id="high", idempotency_key="high", subject_id="high",
+                          cue_id="urgent", severity="critical"))
+        sinks["audio"].fail = frozenset({"audio"})
+        result = core.handle(event(event_id="cancel", idempotency_key="cancel",
+                                   subject_id="high", status="cancelled"))
+        self.assertEqual(result["channels"]["audio"], "failed")
+        self.assertEqual(sinks["audio"].calls[-1][1]["operation"], "restore")
+        audio_calls = len(sinks["audio"].calls)
+        sinks["audio"].fail = frozenset()
+        self.assertEqual(core.tick()["result"], "unchanged")
+        self.assertEqual(len(sinks["audio"].calls), audio_calls)
+
     def test_cancellation_admitted_at_capacity(self):
         core, sinks = self.make_core()
         core.handle(event())
