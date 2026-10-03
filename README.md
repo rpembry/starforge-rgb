@@ -39,3 +39,10 @@ Music input (opt-in) ──────┘
 
 The initial Workbench integration should be a local client of Workbench's API,
 not a new remote RGB endpoint or a change to Workbench's database.
+
+## License and contact
+
+Original project code is licensed under the [MIT License](LICENSE). Dependencies
+and theme or audio assets, if added, retain their own licenses.
+
+Project contact: randall@embry.com.

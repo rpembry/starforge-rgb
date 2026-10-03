@@ -2,5 +2,6 @@
 *
 !/.gitignore
 !/README.md
+!/LICENSE
 
 # Add exact paths here as source, tests, and documentation are created.
