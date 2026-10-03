@@ -250,8 +250,12 @@ class Coordinator:
                 self._retire(key, lease, now)
 
     def _retire(self, key: tuple[str, str], lease: _Lease, now: float) -> None:
-        # A subject identifies one run. Any end, including early expiry/cancel,
-        # blocks silent resurrection; a distinct subject explicitly starts a new run.
+        # Only an explicit subject identifies a renewable run. A subjectless event
+        # has its own bounded replay record, not a long-lived generation tombstone.
+        if lease.plan["subject_id"] is None:
+            return
+        # Any end, including early expiry/cancel, blocks silent resurrection;
+        # a distinct subject explicitly starts a new run.
         until = lease.first_seen + 2 * self.max_lease_age_s
         if until > now:
             self._retired_subjects[key] = until
@@ -385,7 +389,9 @@ class Coordinator:
             if prior[1] == event:
                 return {"result": "suppressed", "reason": "duplicate", "channels": {}}
             return {"result": "rejected", "reason": "replay_conflict", "channels": {}}
-        lease_key = (event.source_id, event.subject_id or event.event_id)
+        # Keep one-shot event IDs and renewable subject IDs in separate namespaces.
+        lease_key = (event.source_id, f"subject:{event.subject_id}" if event.subject_id is not None
+                     else f"event:{event.event_id}")
         cancellation = event.status == "cancelled"
         if not cancellation:
             if lease_key in self._retired_subjects:
