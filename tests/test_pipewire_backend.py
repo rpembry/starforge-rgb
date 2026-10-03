@@ -69,9 +69,9 @@ class Rig:
                  node(11, OTHER, "Audio/Sink", 68)] if self.sink_visible else [node(11, OTHER, "Audio/Sink", 68)]
         if self.processes and self.processes[-1].alive and self.stream_visible:
             name = self.commands[-1][self.commands[-1].index("--properties") + 1]
-            import json
-            graph.extend([node(20, json.loads(name)["node.name"], "Stream/Output/Audio", 90),
-                          link(20, self.link_target)])
+            stream = node(20, json.loads(name)["node.name"], "Stream/Output/Audio", 90)
+            stream["info"]["props"].update(json.loads(name))
+            graph.extend([stream, link(20, self.link_target)])
         return graph
 
     def spawn(self, args, **kwargs):
@@ -115,6 +115,10 @@ class PipeWireTests(unittest.TestCase):
         self.assertEqual(args[args.index("--volume") + 1], "0.05")
         self.assertEqual(args[args.index("--sample-count") + 1], "12000")
         self.assertEqual(args[args.index("--latency") + 1], "20ms")
+        props = json.loads(args[args.index("--properties") + 1])
+        self.assertEqual(props["target.object"], "67")
+        self.assertTrue(all(props[key] is True for key in
+                            ("node.dont-fallback", "node.dont-move", "node.dont-reconnect")))
         self.assertEqual(args[-1], "-")
         self.assertEqual(len(rig.feeds[0]), 24000)
         self.assertEqual(adapter.dispatch("audio", {"operation": "clear"}), "accepted")
@@ -178,6 +182,54 @@ class PipeWireTests(unittest.TestCase):
             check()
             rig.feeds.append(pcm)
         backend.feed = reroute
+        self.assertEqual(adapter.dispatch("audio", plan()), "unknown")
+        self.assertEqual(rig.feeds, [])
+        self.assertFalse(rig.processes[0].alive)
+
+    def test_reroute_after_feeder_check_is_unknown_and_stopped(self):
+        rig, backend, adapter = self.setup_adapter()
+        def reroute_after_queue(process, pcm, check, deadline, clock):
+            check()  # route was correct before PCM was queued
+            rig.feeds.append(pcm)
+            rig.link_target = 11
+        backend.feed = reroute_after_queue
+        self.assertEqual(adapter.dispatch("audio", plan()), "unknown")
+        self.assertFalse(rig.processes[0].alive)
+        self.assertEqual(len(rig.commands), 1)
+
+    def test_missing_target_after_feed_and_extra_link_are_unknown(self):
+        for change in ("missing", "extra"):
+            with self.subTest(change=change):
+                rig, backend, adapter = self.setup_adapter()
+                original_snapshot = rig.snapshot
+                extra = [False]
+                def snapshot():
+                    graph = original_snapshot()
+                    if extra[0]:
+                        if change == "missing":
+                            graph = [obj for obj in graph if obj.get("id") != 10]
+                        else:
+                            graph.append(link(20, 11))
+                    return graph
+                backend.snapshot = snapshot
+                def change_after_queue(process, pcm, check, deadline, clock):
+                    check()
+                    rig.feeds.append(pcm)
+                    extra[0] = True
+                backend.feed = change_after_queue
+                self.assertEqual(adapter.dispatch("audio", plan()), "unknown")
+                self.assertFalse(rig.processes[0].alive)
+
+    def test_unverified_routing_properties_withhold_pcm(self):
+        rig, backend, adapter = self.setup_adapter()
+        original_snapshot = rig.snapshot
+        def snapshot():
+            graph = original_snapshot()
+            for obj in graph:
+                if obj.get("id") == 20:
+                    obj["info"]["props"].pop("node.dont-fallback")
+            return graph
+        backend.snapshot = snapshot
         self.assertEqual(adapter.dispatch("audio", plan()), "unknown")
         self.assertEqual(rig.feeds, [])
         self.assertFalse(rig.processes[0].alive)

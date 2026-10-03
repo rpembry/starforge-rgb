@@ -50,14 +50,20 @@ def _one_sink(graph: list[dict], name: str) -> tuple[int, int] | None:
 
 
 def _owned_graph_state(graph: list[dict], stream_name: str,
-                       sink_id: int) -> tuple[bool, bool]:
+                       sink_id: int, serial: int) -> tuple[bool, bool]:
     """Return (owned node present, exclusively linked to selected sink)."""
-    owned = [node_id for node_id, props in _nodes(graph).items()
+    owned = [(node_id, props) for node_id, props in _nodes(graph).items()
              if props.get("node.name") == stream_name]
     if len(owned) != 1:
         return bool(owned), False
-    outgoing = [target for source, target in _links(graph) if source == owned[0]]
-    return True, bool(outgoing) and all(target == sink_id for target in outgoing)
+    node_id, props = owned[0]
+    # Do not trust flags solely because we requested them: verify the stream
+    # actually exposes the routing controls before supplying any PCM.
+    pinned = (str(props.get("target.object")) == str(serial) and
+              all(props.get(key) in (True, "true") for key in
+                  ("node.dont-fallback", "node.dont-move", "node.dont-reconnect")))
+    outgoing = [target for source, target in _links(graph) if source == node_id]
+    return True, pinned and bool(outgoing) and all(target == sink_id for target in outgoing)
 
 
 def _snapshot() -> list[dict]:
@@ -84,6 +90,7 @@ def _feed_pcm(process, pcm: bytes, check: Callable[[], None], deadline: float,
             offset += os.write(fd, pcm[offset:offset + 4096])
         except BlockingIOError:
             continue
+        check()
     process.stdin.close()
 
 
@@ -180,7 +187,9 @@ class PipeWireBackend:
                 "--raw", "--rate", str(rate), "--channels", str(channels),
                 "--format", "s16", "--sample-count", str(frames),
                 "--latency", "20ms", "--properties",
-                json.dumps({"node.name": stream_name}), "-"]
+                json.dumps({"node.name": stream_name, "target.object": str(serial),
+                            "node.dont-fallback": True, "node.dont-move": True,
+                            "node.dont-reconnect": True}), "-"]
         process = self.spawn(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, shell=False, start_new_session=True)
         # Own it before any further operation can fail or lose acknowledgment.
@@ -191,7 +200,7 @@ class PipeWireBackend:
             graph = self.snapshot()
             if _one_sink(graph, sink_id) != sink:
                 raise GraphError("selected sink identity changed")
-            present, exact = _owned_graph_state(graph, stream_name, sink_node_id)
+            present, exact = _owned_graph_state(graph, stream_name, sink_node_id, serial)
             if not present or not exact:
                 raise GraphError("owned stream lacks exclusive selected-sink link")
             stream_id = next(node_id for node_id, props in _nodes(graph).items()
@@ -210,6 +219,9 @@ class PipeWireBackend:
             else:
                 raise GraphError("exact target link not observed")
             self.feed(process, pcm, check_link, self.clock() + 1.0, self.clock)
+            # A route can change after the final feeder check. A mismatch after
+            # PCM was queued is an unknown outcome and stops the owned stream.
+            check_link()
             return PlaybackReceipt("accepted", token)
         except Exception:
             self._clean()
