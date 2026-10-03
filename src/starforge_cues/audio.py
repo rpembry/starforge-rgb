@@ -161,14 +161,27 @@ class AudioAdapter:
                 return self._stop()
             if operation != "cue":
                 return "unsupported"
-            clip = self.clips.get(plan["cue_id"])
-            if clip is None or self.selected_sink not in self.backend.available_sinks():
-                return "unsupported"
+            # A replacement makes the previous sound obsolete even when the
+            # replacement cue is unmapped or its selected sink disappeared.
             stopped = self._stop()
             if stopped != "accepted":
                 return stopped
-            receipt = self.backend.start(self.selected_sink, clip.wav, self.gain)
-            if receipt.outcome not in ("accepted", "unknown"):
+            clip = self.clips.get(plan["cue_id"])
+            if clip is None or self.selected_sink not in self.backend.available_sinks():
+                return "unsupported"
+            try:
+                receipt = self.backend.start(self.selected_sink, clip.wav, self.gain)
+            except Exception:
+                # The backend may have started playback before its receipt was
+                # lost. With no token to stop, wait through the bounded clip.
+                self._uncertain_until = self.monotonic_clock() + clip.duration_ms / 1000
+                return "unknown"
+            if not isinstance(receipt, PlaybackReceipt) or receipt.outcome not in ("accepted", "unknown"):
+                self._uncertain_until = self.monotonic_clock() + clip.duration_ms / 1000
+                return "unknown"
+            if receipt.token is not None and (not isinstance(receipt.token, str) or
+                                               not 1 <= len(receipt.token) <= 128):
+                self._uncertain_until = self.monotonic_clock() + clip.duration_ms / 1000
                 return "unknown"
             if receipt.outcome == "accepted" and not receipt.token:
                 self._uncertain_until = self.monotonic_clock() + clip.duration_ms / 1000
@@ -182,18 +195,29 @@ class AudioAdapter:
 class FakeAudioBackend:
     """Records fake starts/stops; never loads a platform audio library."""
 
-    def __init__(self, sinks: frozenset[str]):
+    def __init__(self, sinks: frozenset[str],
+                 monotonic_clock: Callable[[], float] | None = None):
+        import time
         self.sinks = sinks
+        self.monotonic_clock = monotonic_clock or time.monotonic
         self.starts: list[tuple[str, str, float]] = []
         self.stops: list[tuple[str, str, int]] = []
-        self.active: set[str] = set()
+        self._active_until: dict[str, float] = {}
         self.fail_start = False
         self.fail_stop = False
         self.unknown_start = False
         self.unknown_stop = False
+        self.raise_after_start = False
 
     def available_sinks(self) -> frozenset[str]:
         return self.sinks
+
+    @property
+    def active(self) -> set[str]:
+        now = self.monotonic_clock()
+        self._active_until = {token: end for token, end in self._active_until.items()
+                              if end > now}
+        return set(self._active_until)
 
     def start(self, sink_id: str, wav: bytes, gain: float) -> PlaybackReceipt:
         if sink_id not in self.sinks:
@@ -204,7 +228,11 @@ class FakeAudioBackend:
         if self.unknown_start:
             return PlaybackReceipt("unknown", None)
         token = f"fake-{len(self.starts)}"
-        self.active.add(token)
+        with wave.open(io.BytesIO(wav), "rb") as reader:
+            duration_s = reader.getnframes() / reader.getframerate()
+        self._active_until[token] = self.monotonic_clock() + duration_s
+        if self.raise_after_start:
+            raise RuntimeError("fake lost start acknowledgment")
         return PlaybackReceipt("accepted", token)
 
     def stop(self, sink_id: str, token: str, fade_ms: int) -> str:
@@ -213,5 +241,5 @@ class FakeAudioBackend:
             raise RuntimeError("fake stop failure")
         if self.unknown_stop:
             return "unknown"
-        self.active.discard(token)
+        self._active_until.pop(token, None)
         return "accepted"

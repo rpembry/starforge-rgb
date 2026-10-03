@@ -40,7 +40,8 @@ def wav_with_seconds(seconds: float) -> bytes:
 class AudioTests(unittest.TestCase):
     def setup_audio(self, clock=None, sinks=None):
         clock = clock or [NOW]
-        backend = FakeAudioBackend(frozenset(sinks if sinks is not None else {SELECTED, OTHER}))
+        backend = FakeAudioBackend(frozenset(sinks if sinks is not None else {SELECTED, OTHER}),
+                                   monotonic_clock=lambda: clock[0])
         clip = original_test_earcon()
         adapter = AudioAdapter(backend, SELECTED, {"job.completed": clip, "urgent": clip},
                                gain=0.05, monotonic_clock=lambda: clock[0])
@@ -164,10 +165,56 @@ class AudioTests(unittest.TestCase):
         core, backend, _adapter, clock = self.setup_audio()
         backend.fail_start = True
         result = core.handle(event(clock[0]))
-        self.assertEqual(result["channels"]["audio"], "failed")
+        self.assertEqual(result["channels"]["audio"], "unknown")
         self.assertEqual(result["channels"]["rgb"], "accepted")
         core.tick()
         self.assertEqual(len(backend.starts), 1)
+
+    def test_lost_ack_after_start_blocks_second_voice_same_clock(self):
+        core, backend, _adapter, clock = self.setup_audio()
+        backend.raise_after_start = True
+        first = core.handle(event(clock[0], event_id="first", idempotency_key="first",
+                                  subject_id="first"))
+        self.assertEqual(first["channels"]["audio"], "unknown")
+        self.assertEqual(len(backend.active), 1)  # fake voice may already be playing
+        second = core.handle(event(clock[0], event_id="second", idempotency_key="second",
+                                   subject_id="second"))
+        self.assertEqual(second["channels"]["audio"], "unknown")
+        self.assertEqual(len(backend.starts), 1)
+        self.assertEqual(len(backend.active), 1)
+        core.tick()
+        self.assertEqual(len(backend.starts), 1)
+        clock[0] += 0.6
+        self.assertEqual(backend.active, set())  # bounded one-shot ended without a token
+        backend.raise_after_start = False
+        core.handle(event(clock[0], event_id="third", idempotency_key="third",
+                          subject_id="third"))
+        self.assertEqual(len(backend.starts), 2)
+        self.assertEqual(len(backend.active), 1)
+
+    def test_unmapped_replacement_stops_old_voice_and_reports_stop_failure(self):
+        core, backend, _adapter, clock = self.setup_audio()
+        core.handle(event(clock[0], event_id="mapped", idempotency_key="mapped",
+                          subject_id="mapped"))
+        self.assertEqual(len(backend.active), 1)
+        replacement = core.handle(event(clock[0], event_id="unmapped", idempotency_key="unmapped",
+                                        subject_id="unmapped", cue_id="not.mapped"))
+        self.assertEqual(replacement["channels"]["audio"], "unsupported")
+        self.assertEqual(replacement["channels"]["rgb"], "accepted")
+        self.assertEqual(len(backend.stops), 1)
+        self.assertEqual(backend.active, set())
+        self.assertEqual(len(backend.starts), 1)
+
+        core, backend, _adapter, clock = self.setup_audio()
+        core.handle(event(clock[0], event_id="mapped", idempotency_key="mapped",
+                          subject_id="mapped"))
+        backend.fail_stop = True
+        failed = core.handle(event(clock[0], event_id="unmapped", idempotency_key="unmapped",
+                                   subject_id="unmapped", cue_id="not.mapped"))
+        self.assertEqual(failed["channels"]["audio"], "failed")
+        self.assertEqual(failed["channels"]["rgb"], "accepted")
+        self.assertEqual(len(backend.starts), 1)
+        self.assertEqual(len(backend.active), 1)
 
     def test_missing_cue_stale_event_and_selected_sink_loss(self):
         core, backend, _adapter, clock = self.setup_audio()
