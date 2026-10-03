@@ -98,11 +98,12 @@ def main(argv: list[str] | None = None) -> int:
         def _render(self) -> bool:
             coordinator.tick()
             view = model.refresh(coordinator.text_snapshot(), unlocked=self._unlocked(),
-                                 now=coordinator.clock())
+                                 elapsed=coordinator.monotonic_clock())
             signature = (view["hidden"], tuple((row["row_id"], row["label"])
                                                for row in view["rows"]),
-                         tuple((item["entry_id"], item["recorded_at"])
-                               for item in view["history"]), view["overflow"])
+                         tuple((item["entry_id"], item["revision"], item["recorded_elapsed"])
+                               for item in view["history"]), view["overflow"],
+                         view["truncated"])
             if signature == self.rendered:
                 return True
             self.rendered = signature
@@ -135,7 +136,9 @@ def main(argv: list[str] | None = None) -> int:
                 self.live.append(row)
                 self.row_ids[row] = item["row_id"]
             if view["overflow"]:
-                self.live.append(self._label(f"{view['overflow']} more groups not shown."))
+                self.live.append(self._label(f"{view['overflow']} more groups in the bounded snapshot."))
+            if view["truncated"]:
+                self.live.append(self._label(f"{view['truncated']} additional cues outside the bounded snapshot."))
             if not view["hidden"]:
                 for item in view["history"]:
                     occurred = datetime.fromisoformat(item["occurred_at"]).astimezone(timezone.utc)

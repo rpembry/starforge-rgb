@@ -402,20 +402,26 @@ class Coordinator:
             raise ValueError("text snapshot limit must be within 1..32")
         with self._lock:
             if not self.policy.permits("text", self.clock()):
-                return {"quiet": True, "total": 0, "entries": []}
+                return {"quiet": True, "total": 0, "source_totals": {}, "entries": []}
             now = self.monotonic_clock()
             live = [(key, lease) for key, lease in self._leases.items() if lease.expiry > now]
             live.sort(key=lambda item: (item[1].priority, item[1].sequence), reverse=True)
+            source_totals: dict[str, int] = {}
+            for _, lease in live:
+                source = lease.plan["source_id"]
+                source_totals[source] = source_totals.get(source, 0) + 1
             entries = []
             for key, lease in live[:limit]:
                 plan = lease.plan
-                entries.append({"entry_id": f"{key[0]}/{key[1]}", "source_id": plan["source_id"],
+                entries.append({"entry_id": f"{key[0]}/{key[1]}", "revision": lease.sequence,
+                                "source_id": plan["source_id"],
                                 "subject_id": plan["subject_id"], "cue_id": plan["cue_id"],
                                 "status": plan["status"], "severity": plan["severity"],
                                 "confidence": plan["confidence"], "text": plan["text"],
                                 "occurred_at": plan["occurred_at"], "expires_at": plan["expires_at"],
                                 "group": plan["group"], "count": plan["count"]})
-            return {"quiet": False, "total": len(live), "entries": entries}
+            return {"quiet": False, "total": len(live), "source_totals": source_totals,
+                    "entries": entries}
 
     def _remember(self, key: tuple[str, str], event_key: tuple[str, str],
                   expiry: float, event: CueEvent) -> None:
