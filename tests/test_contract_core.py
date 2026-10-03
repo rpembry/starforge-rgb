@@ -130,6 +130,56 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(core.tick()["channels"]["rgb"], "accepted")
         self.assertIsNone(rgb.state["rgb"])
 
+    def test_restore_without_text_clears_preempting_text(self):
+        sinks = {name: FakeSink() for name in ("text", "rgb", "audio")}
+        core = Coordinator(sinks, clock=lambda: NOW)
+        low = event(event_id="low", idempotency_key="low", subject_id="low",
+                    cue_id="job.progress", text=None)
+        high = event(event_id="high", idempotency_key="high", subject_id="high",
+                     cue_id="urgent", severity="critical", text="High text")
+        core.handle(low)
+        core.handle(high)
+        self.assertEqual(sinks["text"].state["text"]["text"], "High text")
+        result = core.handle(event(event_id="cancel", idempotency_key="cancel",
+                                   subject_id="high", status="cancelled"))
+        self.assertEqual(result["channels"]["text"], "accepted")
+        self.assertIsNone(sinks["text"].state["text"])
+        self.assertEqual(sinks["rgb"].state["rgb"]["cue_id"], "job.progress")
+
+    def test_failed_clear_retries_only_failed_channel(self):
+        clock = [NOW]
+        sinks = {name: FakeSink() for name in ("text", "rgb", "audio")}
+        core = Coordinator(sinks, clock=lambda: clock[0])
+        core.handle(event())
+        sinks["rgb"].fail = frozenset({"rgb"})
+        clock[0] += 241
+        first = core.tick()
+        self.assertEqual(first["channels"]["rgb"], "failed")
+        self.assertIsNotNone(sinks["rgb"].state["rgb"])
+        audio_calls = len(sinks["audio"].calls)
+        text_calls = len(sinks["text"].calls)
+        sinks["rgb"].fail = frozenset()
+        retry = core.tick()
+        self.assertEqual(retry["channels"], {"rgb": "accepted"})
+        self.assertIsNone(sinks["rgb"].state["rgb"])
+        self.assertEqual(len(sinks["audio"].calls), audio_calls)
+        self.assertEqual(len(sinks["text"].calls), text_calls)
+        self.assertEqual(core.tick()["result"], "unchanged")
+
+    def test_reconciliation_retry_is_bounded(self):
+        clock = [NOW]
+        rgb = FakeSink()
+        core = Coordinator({"rgb": rgb}, clock=lambda: clock[0])
+        core.handle(event())
+        rgb.fail = frozenset({"rgb"})
+        clock[0] += 241
+        self.assertEqual(core.tick()["channels"]["rgb"], "failed")
+        self.assertEqual(core.tick()["channels"]["rgb"], "failed")
+        self.assertEqual(core.tick()["channels"]["rgb"], "failed")
+        count = len(rgb.calls)
+        self.assertEqual(core.tick()["result"], "unchanged")
+        self.assertEqual(len(rgb.calls), count)
+
     def test_cancellation_admitted_at_capacity(self):
         core, sinks = self.make_core()
         core.handle(event())

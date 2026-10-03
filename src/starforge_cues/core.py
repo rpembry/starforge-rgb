@@ -81,6 +81,9 @@ class Coordinator:
         self._rate: dict[str, list[float]] = {}
         self._active_key: tuple[str, str] | None = None
         self._sequence = 0
+        self._desired: dict[str, dict] = {}
+        self._applied: dict[str, dict | None] = {}
+        self._pending: dict[str, tuple[dict, int]] = {}
 
     def _prune(self, now: float) -> None:
         for key, (end, event) in list(self._seen.items()):
@@ -103,28 +106,57 @@ class Coordinator:
         return max(self._leases, key=lambda key: (self._leases[key].priority,
                                                   self._leases[key].sequence))
 
+    def _send(self, channel: str, plan: dict, prior_attempts: int = 0) -> str:
+        sink = self.sinks.get(channel)
+        if plan["operation"] != "clear" and not self.policy.permits(channel):
+            self._pending.pop(channel, None)
+            return "suppressed"
+        if sink is None or channel not in sink.capabilities:
+            self._pending.pop(channel, None)
+            return "unsupported"
+        try:
+            outcome = sink.dispatch(channel, dict(plan))
+        except Exception:
+            # A cue sound may have played before an adapter error; never retry it.
+            retryable = plan["operation"] != "cue" or channel != "audio"
+            if retryable and prior_attempts + 1 < 3:
+                self._pending[channel] = (plan, prior_attempts + 1)
+            else:
+                self._pending.pop(channel, None)
+            return "failed"
+        self._pending.pop(channel, None)
+        if outcome == "accepted":
+            self._applied[channel] = None if plan["operation"] == "clear" else plan
+            return "accepted"
+        # An ambiguous receipt must not be retried automatically.
+        return "unknown"
+
     def _dispatch(self, plan: dict) -> dict[str, str]:
         results = {}
         for channel in CHANNELS:
-            sink = self.sinks.get(channel)
-            if plan["operation"] != "clear" and not self.policy.permits(channel):
-                results[channel] = "suppressed"
-            elif sink is None or channel not in sink.capabilities:
-                results[channel] = "unsupported"
-            elif channel == "text" and plan["operation"] != "clear" and plan["text"] is None:
-                results[channel] = "absent"
+            effective = plan
+            if channel == "text" and plan["operation"] != "clear" and plan["text"] is None:
+                effective = {"operation": "clear", "baseline": None, "text": None}
+                self._desired[channel] = effective
+                if self._applied.get(channel) is None and channel not in self._pending:
+                    results[channel] = "absent"
+                    continue
             else:
-                try:
-                    outcome = sink.dispatch(channel, dict(plan))
-                    results[channel] = outcome if outcome in ("accepted", "unknown") else "unknown"
-                except Exception:
-                    results[channel] = "failed"
+                self._desired[channel] = effective
+            results[channel] = self._send(channel, effective)
         return results
+
+    def _retry_pending(self) -> dict:
+        results = {}
+        for channel, (plan, attempts) in list(self._pending.items()):
+            if self._desired.get(channel) == plan:
+                results[channel] = self._send(channel, plan, attempts)
+        return {"result": "reconciled" if results else "unchanged", "channels": results}
 
     def _reconcile(self) -> dict:
         top = self._top()
         if top == self._active_key:
-            return {"result": "unchanged", "channels": {}}
+            return self._retry_pending()
         self._active_key = top
         if top is None:
             plan = {"operation": "clear", "baseline": None, "text": None}
