@@ -60,6 +60,49 @@ class LifecycleTests(unittest.TestCase):
         core.tick()
         self.assertEqual(rgb.state["rgb"]["cue_id"], "ambient")
 
+    def test_tiny_ttl_cannot_resurrect_same_subject(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        core.handle(event(clock[0], event_id="brief", idempotency_key="brief",
+                          subject_id="run-one", ttl_ms=1))
+        clock[0] += 0.002
+        core.tick()
+        resume = core.handle(event(clock[0], event_id="resume", idempotency_key="resume",
+                                   subject_id="run-one", status="progress"))
+        self.assertEqual(resume["reason"], "lease_limit")
+        new_run = core.handle(event(clock[0], event_id="next", idempotency_key="next",
+                                    subject_id="run-two", status="started"))
+        self.assertEqual(new_run["result"], "accepted")
+
+    def test_early_cancel_retires_subject(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        core.handle(event(clock[0], event_id="running", idempotency_key="running",
+                          subject_id="run-one"))
+        clock[0] += 100
+        cancel = core.handle(event(clock[0], event_id="stop", idempotency_key="stop",
+                                   subject_id="run-one", status="cancelled"))
+        self.assertEqual(cancel["result"], "accepted")
+        resume = core.handle(event(clock[0], event_id="resume", idempotency_key="resume",
+                                   subject_id="run-one", status="progress"))
+        self.assertEqual(resume["reason"], "lease_limit")
+        self.assertEqual(core.handle(event(clock[0], event_id="new", idempotency_key="new",
+                                           subject_id="run-two", status="started"))["result"], "accepted")
+
+    def test_retired_and_active_capacity_keeps_cancellation_available(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        core.handle(event(clock[0], event_id="active", idempotency_key="active",
+                          subject_id="run-one"))
+        for index in range(4095):
+            core._retired_subjects[("other.source", f"retired-{index}")] = NOW + 600
+        cancel = core.handle(event(clock[0], event_id="stop", idempotency_key="stop",
+                                   subject_id="run-one", status="cancelled"))
+        self.assertEqual(cancel["result"], "accepted")
+        self.assertLessEqual(len(core._retired_subjects) + len(core._leases), 4096)
+        self.assertEqual(core.handle(event(clock[0], event_id="next", idempotency_key="next",
+                                           subject_id="run-two"))["reason"], "capacity")
+
     def test_restart_reports_unknown_prior_state_and_current_baseline_dispatch(self):
         rgb = FakeSink()
         audio = FakeSink()

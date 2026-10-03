@@ -247,10 +247,14 @@ class Coordinator:
         for key, lease in list(self._leases.items()):
             if lease.expiry <= now:
                 del self._leases[key]
-                horizon = lease.first_seen + self.max_lease_age_s
-                if lease.renewals and lease.expiry >= horizon:
-                    # Same subject cannot immediately restart a continuous lease.
-                    self._retired_subjects[key] = horizon + self.max_lease_age_s
+                self._retire(key, lease, now)
+
+    def _retire(self, key: tuple[str, str], lease: _Lease, now: float) -> None:
+        # A subject identifies one run. Any end, including early expiry/cancel,
+        # blocks silent resurrection; a distinct subject explicitly starts a new run.
+        until = lease.first_seen + 2 * self.max_lease_age_s
+        if until > now:
+            self._retired_subjects[key] = until
 
     def _top(self) -> tuple[str, str] | None:
         if not self._leases:
@@ -409,7 +413,9 @@ class Coordinator:
             renewals = 0
         self._remember(key, event_key, deadline, event)
         if cancellation:
-            self._leases.pop(lease_key, None)
+            ended = self._leases.pop(lease_key, None)
+            if ended is not None:
+                self._retire(lease_key, ended, monotonic_now)
             reconciliation = self._reconcile()
             return {"result": "accepted", "reason": None, "plan": reconciliation.get("plan"),
                     "channels": reconciliation["channels"]}
