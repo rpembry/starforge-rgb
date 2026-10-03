@@ -24,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     dry.add_argument("--file", required=True, help="JSON event file or - for stdin")
     dry.add_argument("--quiet", action="store_true")
     dry.add_argument("--at", help="UTC RFC3339 fake clock for reproducible simulation")
+    preview = commands.add_parser("theme-preview", help="validate a local theme and resolve synthetic meaning only")
+    preview.add_argument("--directory", type=Path, required=True)
+    preview.add_argument("--file", required=True)
+    preview.add_argument("--rgb-cap", type=float, default=1.0)
     send = commands.add_parser("submit", help="send to local fake-output host")
     send.add_argument("--file", required=True)
     send.add_argument("--socket", type=Path)
@@ -42,7 +46,13 @@ def main(argv: list[str] | None = None) -> int:
                     pass
             return 0
         raw = _raw(args.file)
-        if args.command == "dry-run":
+        if args.command == "theme-preview":
+            from .themes import load_directory
+            event = CueEvent.from_json(raw)
+            theme = load_directory(args.directory)
+            result = {"theme": theme.theme_id, "version": theme.version,
+                      "channels": theme.resolve(event, frozenset(CHANNELS), args.rgb_cap)}
+        elif args.command == "dry-run":
             event = CueEvent.from_json(raw)
             instant = None
             if args.at:
@@ -57,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             from .transport import default_socket, submit
             result = submit(args.socket or default_socket(), raw)
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0 if result["result"] == "accepted" else 2
+        return 0 if args.command == "theme-preview" or result["result"] == "accepted" else 2
     except (ContractError, OSError, RuntimeError, ValueError) as exc:
         # Contract diagnostics include field names only, never notification text.
         print(f"cue error: {exc}", file=sys.stderr)
