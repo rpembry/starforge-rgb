@@ -1,0 +1,6 @@
+# Default deny. Explicitly allow only reviewed project files.
+*
+!/.gitignore
+!/README.md
+
+# Add exact paths here as source, tests, and documentation are created.
