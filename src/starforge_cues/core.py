@@ -133,7 +133,10 @@ class Coordinator:
         self._allow_initial_host_generation = False
         self._baseline_plan: dict | None = None
         self._emitted_baseline_generation = -1
-        self._last_permitted = {channel: True for channel in CHANNELS}
+        # Recovery may load a quiet policy before the first timer tick. Track its
+        # actual initial state so unquiet cannot replay baseline audio as a cue.
+        self._last_permitted = {channel: policy.permits(channel, self.clock())
+                                for channel in CHANNELS}
         self._desired: dict[str, dict] = {}
         self._applied: dict[str, dict | None] = {}
         self._pending: dict[str, tuple[dict, int]] = {}

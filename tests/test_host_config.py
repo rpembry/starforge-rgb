@@ -184,6 +184,31 @@ class PrivateFileTests(unittest.TestCase):
                 self.assertEqual(reload_private_config(self.path, core)["result"], "loaded")
                 self.assertEqual(rgb.state["rgb"]["cue_id"], "ambient.next")
 
+    def test_unquiet_recovery_never_replays_baseline_audio(self):
+        for initial in ("missing", "valid_quiet"):
+            for tick_before_resume in (False, True):
+                with self.subTest(initial=initial, tick=tick_before_resume):
+                    if initial == "missing":
+                        self.path.unlink(missing_ok=True)
+                    else:
+                        self.write(document(1, "ambient.quiet", manual=True, windows=False))
+                    audio = FakeSink()
+                    core, status = recover_private_config(self.path, sinks={"audio": audio},
+                                                          clock=lambda: NOW)
+                    self.assertEqual(status, "missing" if initial == "missing" else "loaded")
+                    self.assertTrue(core.policy.quiet)
+                    if initial == "missing":
+                        self.write(document(1, "ambient.quiet", manual=True, windows=False))
+                        self.assertEqual(reload_private_config(self.path, core)["result"], "loaded")
+                    if tick_before_resume:
+                        core.tick()
+                    calls_before = len(audio.calls)
+                    self.write(document(2, "ambient.current", manual=False, windows=False))
+                    self.assertEqual(reload_private_config(self.path, core)["result"], "loaded")
+                    self.assertEqual(len(audio.calls), calls_before)
+                    self.assertIsNone(audio.state["audio"])
+                    self.assertTrue(all(plan["operation"] == "clear" for _, plan in audio.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
