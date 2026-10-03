@@ -18,7 +18,7 @@ import wave
 import io
 from typing import Callable
 
-from .audio import MAX_GAIN, MAX_WAV_BYTES, PlaybackReceipt, _SINK_ID
+from .audio import DEFAULT_GAIN, MAX_GAIN, MAX_WAV_BYTES, PlaybackReceipt, _SINK_ID
 
 
 class GraphError(RuntimeError):
@@ -104,9 +104,13 @@ class PipeWireBackend:
     def __init__(self, *, snapshot: Callable[[], list[dict]] = _snapshot,
                  spawn: Callable = subprocess.Popen, feed: Callable = _feed_pcm,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 commissioning_override: bool = False):
+        if type(commissioning_override) is not bool:
+            raise ValueError("invalid commissioning override")
         self.snapshot, self.spawn, self.feed = snapshot, spawn, feed
         self.clock, self.sleep = clock, sleep
+        self.commissioning_override = commissioning_override
         self._owned = None  # process, stream name, target node id, token, stream node id
 
     def available_sinks(self) -> frozenset[str]:
@@ -162,7 +166,8 @@ class PipeWireBackend:
             return PlaybackReceipt("unknown", None)
         if not isinstance(sink_id, str) or not _SINK_ID.fullmatch(sink_id):
             raise ValueError("invalid exact sink")
-        if type(gain) not in (float, int) or not 0 <= gain <= MAX_GAIN:
+        ceiling = MAX_GAIN if self.commissioning_override else DEFAULT_GAIN
+        if type(gain) not in (float, int) or not 0 <= gain <= ceiling:
             raise ValueError("invalid gain")
         if not isinstance(wav, bytes) or not 44 <= len(wav) <= MAX_WAV_BYTES:
             raise ValueError("invalid bounded WAV")

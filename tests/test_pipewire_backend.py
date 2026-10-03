@@ -90,9 +90,10 @@ class Rig:
     def sleep(self, seconds):
         self.now += seconds
 
-    def backend(self):
+    def backend(self, commissioning_override=False):
         return PipeWireBackend(snapshot=self.snapshot, spawn=self.spawn,
-                               feed=self.feed, clock=lambda: self.now, sleep=self.sleep)
+                               feed=self.feed, clock=lambda: self.now, sleep=self.sleep,
+                               commissioning_override=commissioning_override)
 
 
 def plan(cue="job.completed"):
@@ -123,6 +124,42 @@ class PipeWireTests(unittest.TestCase):
         self.assertEqual(len(rig.feeds[0]), 24000)
         self.assertEqual(adapter.dispatch("audio", {"operation": "clear"}), "accepted")
         self.assertEqual(rig.processes[0].terminations, 1)
+
+    def test_15_percent_requires_independent_adapter_and_backend_opt_in(self):
+        clip = original_test_earcon()
+        rig = Rig()
+        backend = rig.backend()
+        adapter = AudioAdapter(backend, SINK, {"job.completed": clip}, gain=0.15,
+                               commissioning_override=True)
+        self.assertEqual(adapter.dispatch("audio", plan()), "unknown")
+        self.assertEqual(rig.commands, [])
+
+        rig = Rig()
+        backend = rig.backend(commissioning_override=True)
+        with self.assertRaises(ValueError):
+            AudioAdapter(backend, SINK, {"job.completed": clip}, gain=0.15)
+        with self.assertRaises(ValueError):
+            AudioAdapter(backend, SINK, {"job.completed": clip}, gain=0.1501,
+                         commissioning_override=True)
+        adapter = AudioAdapter(backend, SINK, {"job.completed": clip}, gain=0.15,
+                               commissioning_override=True)
+        self.assertEqual(adapter.dispatch("audio", plan()), "accepted")
+        args = rig.commands[0]
+        self.assertEqual(args[args.index("--volume") + 1], "0.15")
+        self.assertEqual(args[args.index("--target") + 1], "67")
+        self.assertEqual(len(rig.feeds), 1)
+        self.assertEqual(adapter.dispatch("audio", {"operation": "clear"}), "accepted")
+
+    def test_backend_direct_gain_bounds_and_asset_checks_before_spawn(self):
+        rig = Rig()
+        backend = rig.backend(commissioning_override=True)
+        clip = original_test_earcon()
+        for gain in (0.1501, float("nan"), -0.01):
+            with self.assertRaises(ValueError):
+                backend.start(SINK, clip.wav, gain)
+        with self.assertRaises(ValueError):
+            backend.start(SINK, b"invalid", 0.15)
+        self.assertEqual(rig.commands, [])
 
     def test_missing_or_wrong_target_never_receives_pcm(self):
         rig, backend, adapter = self.setup_adapter()
