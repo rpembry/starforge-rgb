@@ -87,6 +87,8 @@ class QuietPolicy:
 @dataclass(frozen=True)
 class _Lease:
     expiry: float
+    first_seen: float
+    renewals: int
     priority: int
     sequence: int
     plan: dict
@@ -98,9 +100,12 @@ class Coordinator:
     def __init__(self, sinks: dict[str, Sink] | None = None,
                  clock: Callable[[], float] | None = None, policy: QuietPolicy = QuietPolicy(),
                  sources: dict[str, SourceCapabilities] | None = None,
-                 own_origins: frozenset[str] = frozenset(), cooldown_seconds: float = 0):
+                 own_origins: frozenset[str] = frozenset(), cooldown_seconds: float = 0,
+                 max_lease_age_s: float = 3600,
+                 monotonic_clock: Callable[[], float] | None = None):
         import time
         self.clock = clock or time.time
+        self.monotonic_clock = monotonic_clock or (clock if clock is not None else time.monotonic)
         self.sinks = sinks or {}
         self.policy = policy
         self.sources = sources
@@ -108,6 +113,9 @@ class Coordinator:
         if not 0 <= cooldown_seconds <= 60:
             raise ValueError("cooldown must be within 0..60 seconds")
         self.cooldown_seconds = cooldown_seconds
+        if type(max_lease_age_s) not in (int, float) or not 300 <= max_lease_age_s <= 86400:
+            raise ValueError("maximum lease age must be within 300..86400 seconds")
+        self.max_lease_age_s = max_lease_age_s
         self._lock = RLock()
         self._seen: dict[tuple[str, str], tuple[float, CueEvent]] = {}
         self._seen_events: dict[tuple[str, str], tuple[str, str]] = {}
@@ -122,11 +130,43 @@ class Coordinator:
         self._desired: dict[str, dict] = {}
         self._applied: dict[str, dict | None] = {}
         self._pending: dict[str, tuple[dict, int]] = {}
+        self._feedback: dict[tuple[str, str], float] = {}
+        self._retired_subjects: dict[tuple[str, str], float] = {}
+        self.recovery_result: dict | None = None
 
-    def set_baseline(self, generation: int, cue_id: str | None, text: str | None = None) -> dict:
+    @classmethod
+    def recover_baseline(cls, generation: int, cue_id: str | None, text: str | None = None,
+                         **options) -> "Coordinator":
+        """Start a fresh process from host-supplied current settings, never old leases."""
+        coordinator = cls(**options)
+        audio_clear = None
+        if cue_id is not None:
+            audio_clear = coordinator._send("audio", {"operation": "clear", "baseline": None, "text": None})
+        dispatched = coordinator.set_baseline(generation, cue_id, text, suppress_audio_restore=True)
+        coordinator.recovery_result = {"previous_output": "unknown",
+                                       "audio_clear": audio_clear,
+                                       "baseline_dispatch": dispatched}
+        return coordinator
+
+    def record_feedback(self, source_id: str, correlation_id: str, ttl_s: float = 60) -> None:
+        """Register one expected echo from a specific source; no wildcard matching."""
+        identifier = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}"
+        if (not isinstance(source_id, str) or not re.fullmatch(identifier, source_id) or
+                not isinstance(correlation_id, str) or not re.fullmatch(identifier, correlation_id) or
+                type(ttl_s) not in (int, float) or not 0 < ttl_s <= 300):
+            raise ValueError("invalid feedback registration")
+        with self._lock:
+            now = self.monotonic_clock()
+            self._prune(now)
+            if len(self._feedback) >= 1024 and (source_id, correlation_id) not in self._feedback:
+                self._feedback.pop(next(iter(self._feedback)))
+            self._feedback[(source_id, correlation_id)] = now + ttl_s
+
+    def set_baseline(self, generation: int, cue_id: str | None, text: str | None = None,
+                     suppress_audio_restore: bool = False) -> dict:
         """Host-owned baseline update; an active lease continues until it ends."""
         with self._lock:
-            self._prune(self.clock())
+            self._prune(self.monotonic_clock())
             if type(generation) is not int or generation <= self._baseline_generation:
                 raise ValueError("baseline generation must increase")
             if cue_id is not None and (not isinstance(cue_id, str) or
@@ -141,11 +181,11 @@ class Coordinator:
                 "severity": "info", "source_id": "local.baseline", "confidence": "known",
                 "subject_id": None, "text": text, "expires_at": None,
                 "baseline": cue_id, "baseline_generation": generation}
-            return self._reconcile(suppress_audio_restore=self._audio_resuming())
+            return self._reconcile(suppress_audio_restore=suppress_audio_restore or self._audio_resuming())
 
     def set_policy(self, policy: QuietPolicy) -> dict:
         with self._lock:
-            self._prune(self.clock())
+            self._prune(self.monotonic_clock())
             self.policy = policy
             state = self._reconcile(suppress_audio_restore=self._audio_resuming())
             changed = self._sync_policy()
@@ -188,6 +228,12 @@ class Coordinator:
         return {"result": "reconciled" if results else "unchanged", "channels": results}
 
     def _prune(self, now: float) -> None:
+        for key, end in list(self._retired_subjects.items()):
+            if end <= now:
+                del self._retired_subjects[key]
+        for key, end in list(self._feedback.items()):
+            if end <= now:
+                del self._feedback[key]
         for key, (end, event) in list(self._seen.items()):
             if end <= now:
                 del self._seen[key]
@@ -201,6 +247,18 @@ class Coordinator:
         for key, lease in list(self._leases.items()):
             if lease.expiry <= now:
                 del self._leases[key]
+                self._retire(key, lease, now)
+
+    def _retire(self, key: tuple[str, str], lease: _Lease, now: float) -> None:
+        # Only an explicit subject identifies a renewable run. A subjectless event
+        # has its own bounded replay record, not a long-lived generation tombstone.
+        if lease.plan["subject_id"] is None:
+            return
+        # Any end, including early expiry/cancel, blocks silent resurrection;
+        # a distinct subject explicitly starts a new run.
+        until = lease.first_seen + 2 * self.max_lease_age_s
+        if until > now:
+            self._retired_subjects[key] = until
 
     def _top(self) -> tuple[str, str] | None:
         if not self._leases:
@@ -283,7 +341,7 @@ class Coordinator:
     def tick(self) -> dict:
         """Expire leases and dispatch a clear or restored baseline, without new input."""
         with self._lock:
-            self._prune(self.clock())
+            self._prune(self.monotonic_clock())
             state = self._reconcile(suppress_audio_restore=self._audio_resuming())
             policy = self._sync_policy()
             return state if state["result"] != "unchanged" else policy
@@ -310,14 +368,18 @@ class Coordinator:
             if capabilities is None or not capabilities.supports(event):
                 return {"result": "rejected", "reason": "source_capability", "channels": {}}
         now = self.clock()
-        self._prune(now)
+        monotonic_now = self.monotonic_clock()
+        self._prune(monotonic_now)
         self._reconcile(suppress_audio_restore=self._audio_resuming())
         self._sync_policy()
+        if (event.source_id, event.correlation_id) in self._feedback:
+            return {"result": "suppressed", "reason": "feedback_loop", "channels": {}}
         expiry = event.occurred_at.timestamp() + event.ttl_ms / 1000
         if event.occurred_at.timestamp() > now + 60 or event.observed_at.timestamp() > now + 60:
             return {"result": "suppressed", "reason": "future", "channels": {}}
         if expiry <= now:
             return {"result": "suppressed", "reason": "stale", "channels": {}}
+        deadline = monotonic_now + (expiry - now)
         key = (event.source_id, event.idempotency_key)
         event_key = (event.source_id, event.event_id)
         prior = self._seen.get(key)
@@ -327,22 +389,39 @@ class Coordinator:
             if prior[1] == event:
                 return {"result": "suppressed", "reason": "duplicate", "channels": {}}
             return {"result": "rejected", "reason": "replay_conflict", "channels": {}}
-        lease_key = (event.source_id, event.subject_id or event.event_id)
+        # Keep one-shot event IDs and renewable subject IDs in separate namespaces.
+        lease_key = (event.source_id, f"subject:{event.subject_id}" if event.subject_id is not None
+                     else f"event:{event.event_id}")
         cancellation = event.status == "cancelled"
         if not cancellation:
+            if lease_key in self._retired_subjects:
+                return {"result": "suppressed", "reason": "lease_limit", "channels": {}}
             if len(self._rate) >= 256 and event.source_id not in self._rate:
                 return {"result": "suppressed", "reason": "source_limit", "channels": {}}
-            if len(self._seen) >= 4096 or (len(self._leases) >= 4096 and lease_key not in self._leases):
+            if (len(self._seen) >= 4096 or
+                    (len(self._leases) + len(self._retired_subjects) >= 4096 and lease_key not in self._leases)):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
             recent = self._rate.get(event.source_id, [])
-            if self.cooldown_seconds and recent and now - recent[-1] < self.cooldown_seconds:
+            if self.cooldown_seconds and recent and monotonic_now - recent[-1] < self.cooldown_seconds:
                 return {"result": "suppressed", "reason": "cooldown", "channels": {}}
             if len(recent) >= 10:
                 return {"result": "suppressed", "reason": "rate_limit", "channels": {}}
-            self._rate[event.source_id] = recent + [now]
-        self._remember(key, event_key, expiry, event)
+            self._rate[event.source_id] = recent + [monotonic_now]
+            existing = self._leases.get(lease_key)
+            first_seen = existing.first_seen if existing else monotonic_now
+            renewals = existing.renewals + 1 if existing else 0
+            deadline = min(deadline, first_seen + self.max_lease_age_s)
+            if deadline <= monotonic_now:
+                return {"result": "suppressed", "reason": "lease_limit", "channels": {}}
+            expiry = now + (deadline - monotonic_now)
+        else:
+            first_seen = monotonic_now
+            renewals = 0
+        self._remember(key, event_key, deadline, event)
         if cancellation:
-            self._leases.pop(lease_key, None)
+            ended = self._leases.pop(lease_key, None)
+            if ended is not None:
+                self._retire(lease_key, ended, monotonic_now)
             reconciliation = self._reconcile()
             return {"result": "accepted", "reason": None, "plan": reconciliation.get("plan"),
                     "channels": reconciliation["channels"]}
@@ -353,7 +432,7 @@ class Coordinator:
                 "text": event.text,
                 "expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat(),
                 "baseline": event.cue_id}
-        self._leases[lease_key] = _Lease(expiry, {"info": 1, "warning": 2,
+        self._leases[lease_key] = _Lease(deadline, first_seen, renewals, {"info": 1, "warning": 2,
                                                  "critical": 3}[event.severity], self._sequence, plan)
         if self._top() != lease_key:
             return {"result": "accepted", "reason": None, "plan": plan,
