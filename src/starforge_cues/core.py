@@ -141,15 +141,24 @@ class Coordinator:
                 "severity": "info", "source_id": "local.baseline", "confidence": "known",
                 "subject_id": None, "text": text, "expires_at": None,
                 "baseline": cue_id, "baseline_generation": generation}
-            return self._reconcile()
+            return self._reconcile(suppress_audio_restore=self._audio_resuming())
 
     def set_policy(self, policy: QuietPolicy) -> dict:
         with self._lock:
             self._prune(self.clock())
             self.policy = policy
-            state = self._reconcile()
+            state = self._reconcile(suppress_audio_restore=self._audio_resuming())
             changed = self._sync_policy()
             return state if state["result"] != "unchanged" else changed
+
+    def _audio_resuming(self) -> bool:
+        return not self._last_permitted["audio"] and self.policy.permits("audio", self.clock())
+
+    def _current_plan(self) -> dict:
+        top = self._top()
+        if top is not None:
+            return {**self._leases[top].plan, "operation": "restore"}
+        return self._baseline_plan or {"operation": "clear", "baseline": None, "text": None}
 
     def _sync_policy(self) -> dict:
         """Clear newly muted outputs; restore visible state when allowed again."""
@@ -159,12 +168,23 @@ class Coordinator:
             permitted = self.policy.permits(channel, now)
             before = self._last_permitted[channel]
             self._last_permitted[channel] = permitted
-            if before and not permitted and self._applied.get(channel) is not None:
-                results[channel] = self._send(channel, {"operation": "clear", "baseline": None, "text": None})
-            elif not before and permitted and channel != "audio":
-                desired = self._desired.get(channel)
-                if desired and desired["operation"] != "clear":
-                    results[channel] = self._send(channel, {**desired, "operation": "restore"})
+            if before and not permitted:
+                clear = {"operation": "clear", "baseline": None, "text": None}
+                needs_clear = self._applied.get(channel) is not None or channel in self._pending
+                self._desired[channel] = clear
+                if needs_clear:
+                    results[channel] = self._send(channel, clear)
+            elif not before and permitted:
+                if channel == "audio":
+                    # Never replay an old cue/sound on resume. A failed clear stays pending.
+                    self._desired[channel] = {"operation": "clear", "baseline": None, "text": None}
+                    continue
+                desired = self._current_plan()
+                if channel == "text" and desired["operation"] != "clear" and desired["text"] is None:
+                    desired = {"operation": "clear", "baseline": None, "text": None}
+                self._desired[channel] = desired
+                if desired["operation"] != "clear":
+                    results[channel] = self._send(channel, desired)
         return {"result": "reconciled" if results else "unchanged", "channels": results}
 
     def _prune(self, now: float) -> None:
@@ -214,9 +234,18 @@ class Coordinator:
         # An ambiguous receipt must not be retried automatically.
         return "unknown"
 
-    def _dispatch(self, plan: dict) -> dict[str, str]:
+    def _dispatch(self, plan: dict, suppress_audio_restore: bool = False) -> dict[str, str]:
         results = {}
         for channel in CHANNELS:
+            if channel == "audio" and plan["operation"] == "restore" and suppress_audio_restore:
+                self._desired[channel] = {"operation": "clear", "baseline": None, "text": None}
+                results[channel] = "suppressed"
+                continue
+            if plan["operation"] != "clear" and not self.policy.permits(channel, self.clock()):
+                # Keep a pending clear across quiet-state changes and new cue plans.
+                self._desired[channel] = {"operation": "clear", "baseline": None, "text": None}
+                results[channel] = "suppressed"
+                continue
             effective = plan
             if channel == "text" and plan["operation"] != "clear" and plan["text"] is None:
                 effective = {"operation": "clear", "baseline": None, "text": None}
@@ -236,7 +265,7 @@ class Coordinator:
                 results[channel] = self._send(channel, plan, attempts)
         return {"result": "reconciled" if results else "unchanged", "channels": results}
 
-    def _reconcile(self) -> dict:
+    def _reconcile(self, suppress_audio_restore: bool = False) -> dict:
         top = self._top()
         if (top == self._active_key and
                 (top is not None or self._emitted_baseline_generation == self._baseline_generation)):
@@ -248,13 +277,14 @@ class Coordinator:
         else:
             plan = {**self._leases[top].plan, "operation": "restore",
                     "baseline": self._leases[top].plan["cue_id"]}
-        return {"result": "reconciled", "plan": plan, "channels": self._dispatch(plan)}
+        return {"result": "reconciled", "plan": plan,
+                "channels": self._dispatch(plan, suppress_audio_restore)}
 
     def tick(self) -> dict:
         """Expire leases and dispatch a clear or restored baseline, without new input."""
         with self._lock:
             self._prune(self.clock())
-            state = self._reconcile()
+            state = self._reconcile(suppress_audio_restore=self._audio_resuming())
             policy = self._sync_policy()
             return state if state["result"] != "unchanged" else policy
 
@@ -281,7 +311,7 @@ class Coordinator:
                 return {"result": "rejected", "reason": "source_capability", "channels": {}}
         now = self.clock()
         self._prune(now)
-        self._reconcile()
+        self._reconcile(suppress_audio_restore=self._audio_resuming())
         self._sync_policy()
         expiry = event.occurred_at.timestamp() + event.ttl_ms / 1000
         if event.occurred_at.timestamp() > now + 60 or event.observed_at.timestamp() > now + 60:
