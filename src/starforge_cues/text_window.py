@@ -42,6 +42,11 @@ def main(argv: list[str] | None = None) -> int:
                       help="run a foreground restricted local cue receiver")
     parser.add_argument("--socket", type=Path, help="required for --serve")
     parser.add_argument("--config", type=Path, help="required protected settings file for --serve")
+    parser.add_argument("--manual-audio-sink", help="exact PipeWire sink name; enables only manual.test audio")
+    parser.add_argument("--manual-audio-gain", type=float, default=0.05,
+                        help="per-stream gain, normally at most 0.05")
+    parser.add_argument("--commissioning-override", action="store_true",
+                        help="explicit one-off gain gate up to 0.15; does not change system volume")
     parser.add_argument("--exclude-source", action="append", default=[],
                         help="hide this source from indicators and history")
     args = parser.parse_args(argv)
@@ -49,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--serve requires --socket and --config")
     if args.synthetic_preview and (args.socket is not None or args.config is not None):
         parser.error("synthetic preview does not use a socket or configuration")
+    if args.synthetic_preview and (args.manual_audio_sink is not None or
+                                   args.manual_audio_gain != 0.05 or args.commissioning_override):
+        parser.error("synthetic preview does not use audio output")
     if len(args.exclude_source) > 32:
         parser.error("at most 32 source exclusions")
 
@@ -59,13 +67,22 @@ def main(argv: list[str] | None = None) -> int:
     except (ImportError, ValueError) as exc:
         parser.error(f"GTK4 is unavailable: {exc}")
 
-    sink = TextProjectionSink()
+    if args.serve:
+        from .manual_host import manual_sinks
+        try:
+            sinks = manual_sinks(args.manual_audio_sink, gain=args.manual_audio_gain,
+                                 commissioning_override=args.commissioning_override)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        sinks = {"text": TextProjectionSink()}
+    sink = sinks["text"]
     if args.synthetic_preview:
         coordinator = _synthetic_coordinator(sink)
         config_status = "synthetic"
     else:
         from .host_config import recover_private_config
-        coordinator, config_status = recover_private_config(args.config, sinks={"text": sink})
+        coordinator, config_status = recover_private_config(args.config, sinks=sinks)
     model = TextStackModel(excluded_sources=frozenset(args.exclude_source))
 
     class WindowApp(Gtk.Application):
@@ -162,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
                 self.server.shutdown()
                 self.server.close()
                 self.server = None
+            audio = sinks.get("audio")
+            if audio is not None:
+                try:
+                    audio.dispatch("audio", {"operation": "clear"})
+                except Exception:
+                    pass  # Cannot claim physical silence from an adapter result.
             return False
 
         def do_activate(self):
@@ -205,7 +228,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.serve:
                 from .transport import LocalServer
                 try:
-                    self.server = LocalServer(args.socket, coordinator)
+                    if "audio" in sinks:
+                        from .manual_host import manual_event_allowed
+                        self.server = LocalServer(args.socket, coordinator,
+                                                  event_filter=manual_event_allowed)
+                    else:
+                        self.server = LocalServer(args.socket, coordinator)
                 except (OSError, RuntimeError) as exc:
                     parser.error(f"local receiver unavailable: {exc}")
                 self.server_thread = Thread(target=self.server.serve_forever, daemon=True)
@@ -215,7 +243,8 @@ def main(argv: list[str] | None = None) -> int:
             self.window.present()
 
     # Only a generic status is emitted; never print a settings path or cue body.
-    print(f"text window mode: {config_status}")
+    print(f"text window mode: {config_status}; manual audio: "
+          f"{'armed' if 'audio' in sinks else 'disabled'}")
     return WindowApp().run([])
 
 
