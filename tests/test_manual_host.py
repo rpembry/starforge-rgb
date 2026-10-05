@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 import errno
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from starforge_cues.audio import FakeAudioBackend
 from starforge_cues.core import Coordinator, QuietPolicy
@@ -83,6 +86,13 @@ class ManualHostTests(unittest.TestCase):
                     self.assertEqual(result["channels"]["text"], "accepted")
                     self.assertEqual(result["channels"]["audio"], "accepted")
                     self.assertEqual(len(backend.starts), 1)
+                    from starforge_cues.cli import main
+                    with patch("starforge_cues.manual_host.manual_event",
+                               return_value=manual_event(instant=NOW, event_id="cli-submit")):
+                        with redirect_stdout(io.StringIO()) as output:
+                            self.assertEqual(main(["manual-submit", "--socket", str(path)]), 0)
+                    self.assertEqual(json.loads(output.getvalue())["channels"]["audio"], "accepted")
+                    self.assertEqual(len(backend.starts), 2)
                 finally:
                     host.shutdown()
                     worker.join()
