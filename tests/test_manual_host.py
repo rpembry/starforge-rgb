@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from starforge_cues.audio import FakeAudioBackend
 from starforge_cues.core import Coordinator, QuietPolicy
-from starforge_cues.manual_host import MANUAL_CUE, manual_event, manual_sinks
+from starforge_cues.manual_host import MANUAL_CUE, manual_event, manual_event_allowed, manual_sinks
 from starforge_cues.transport import LocalServer, submit
 
 NOW = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
@@ -29,6 +29,7 @@ class ManualHostTests(unittest.TestCase):
         core = Coordinator(sinks, clock=lambda: NOW.timestamp())
         event = manual_event(instant=NOW, event_id="synthetic-one")
         self.assertEqual(event.cue_id, MANUAL_CUE)
+        self.assertTrue(manual_event_allowed(event))
         result = core.handle(event)
         self.assertEqual(result["channels"]["text"], "accepted")
         self.assertEqual(result["channels"]["audio"], "accepted")
@@ -70,7 +71,7 @@ class ManualHostTests(unittest.TestCase):
             sinks = manual_sinks("selected.speaker", backend=backend)
             core = Coordinator(sinks, clock=lambda: NOW.timestamp())
             try:
-                host = LocalServer(path, core)
+                host = LocalServer(path, core, event_filter=manual_event_allowed)
             except PermissionError as exc:
                 if exc.errno == errno.EPERM:
                     self.skipTest("sandbox denies Unix socket bind")
@@ -79,6 +80,20 @@ class ManualHostTests(unittest.TestCase):
                 worker = threading.Thread(target=host.serve_forever, daemon=True)
                 worker.start()
                 try:
+                    denied_event = manual_event(instant=NOW, event_id="synthetic-denied")
+                    denied = {**denied_event.__dict__,
+                              "occurred_at": denied_event.occurred_at.isoformat(),
+                              "observed_at": denied_event.observed_at.isoformat()}
+                    for field, value in (("source_id", "arbitrary.source"),
+                                         ("text", "Arbitrary private message"),
+                                         ("status", "failed"),
+                                         ("cue_id", "job.completed")):
+                        with self.subTest(field=field):
+                            attempt = {**denied, field: value}
+                            self.assertEqual(submit(path, json.dumps(attempt).encode())["reason"],
+                                             "receiver_scope")
+                    self.assertEqual(backend.starts, [])
+                    self.assertEqual(core.text_snapshot()["total"], 0)
                     event = manual_event(instant=NOW, event_id="synthetic-socket")
                     payload = {**event.__dict__, "occurred_at": event.occurred_at.isoformat(),
                                "observed_at": event.observed_at.isoformat()}
@@ -97,3 +112,30 @@ class ManualHostTests(unittest.TestCase):
                     host.shutdown()
                     worker.join()
             self.assertFalse(path.exists())
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "POSIX Unix socket required")
+    def test_receiver_scope_exception_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "private" / "cue.sock"
+            core = Coordinator(clock=lambda: NOW.timestamp())
+            def broken_filter(_event):
+                raise RuntimeError("synthetic receiver error")
+            try:
+                host = LocalServer(path, core, event_filter=broken_filter)
+            except PermissionError as exc:
+                if exc.errno == errno.EPERM:
+                    self.skipTest("sandbox denies Unix socket bind")
+                raise
+            with host:
+                worker = threading.Thread(target=host.serve_forever, daemon=True)
+                worker.start()
+                try:
+                    event = manual_event(instant=NOW, event_id="synthetic-fail-closed")
+                    payload = {**event.__dict__, "occurred_at": event.occurred_at.isoformat(),
+                               "observed_at": event.observed_at.isoformat()}
+                    self.assertEqual(submit(path, json.dumps(payload).encode())["reason"],
+                                     "receiver_scope")
+                    self.assertEqual(core.text_snapshot()["total"], 0)
+                finally:
+                    host.shutdown()
+                    worker.join()

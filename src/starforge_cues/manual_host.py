@@ -9,6 +9,18 @@ from .pipewire_backend import PipeWireBackend
 from .text_stack import TextProjectionSink
 
 MANUAL_CUE = "manual.test"
+MANUAL_TEXT = "Manual notification test."
+
+
+def manual_event_allowed(event: CueEvent) -> bool:
+    """Bound the audio-enabled receiver to the generated manual event shape."""
+    return (event.source_id == "manual.local" and event.cue_id == MANUAL_CUE and
+            event.confidence == "known" and event.origin_id == "starforge.manual" and
+            event.status == "succeeded" and event.severity == "info" and
+            event.text == MANUAL_TEXT and event.ttl_ms == 30000 and
+            event.subject_id == event.event_id == event.idempotency_key and
+            event.correlation_id is None and event.metadata == {} and
+            event.occurred_at == event.observed_at)
 
 
 def manual_sinks(sink_name: str | None = None, *, gain: float = DEFAULT_GAIN,
@@ -36,5 +48,5 @@ def manual_event(*, instant: datetime | None = None, event_id: str | None = None
         "cue_id": MANUAL_CUE, "source_id": "manual.local", "confidence": "known",
         "subject_id": identifier, "origin_id": "starforge.manual",
         "occurred_at": stamp, "observed_at": stamp, "status": "succeeded",
-        "severity": "info", "ttl_ms": 30000, "text": "Manual notification test.",
+        "severity": "info", "ttl_ms": 30000, "text": MANUAL_TEXT,
     })

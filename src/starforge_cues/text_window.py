@@ -228,7 +228,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.serve:
                 from .transport import LocalServer
                 try:
-                    self.server = LocalServer(args.socket, coordinator)
+                    if "audio" in sinks:
+                        from .manual_host import manual_event_allowed
+                        self.server = LocalServer(args.socket, coordinator,
+                                                  event_filter=manual_event_allowed)
+                    else:
+                        self.server = LocalServer(args.socket, coordinator)
                 except (OSError, RuntimeError) as exc:
                     parser.error(f"local receiver unavailable: {exc}")
                 self.server_thread = Thread(target=self.server.serve_forever, daemon=True)

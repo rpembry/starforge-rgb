@@ -7,6 +7,7 @@ import socket
 import socketserver
 import stat
 from threading import BoundedSemaphore
+from typing import Callable
 
 from .contract import ContractError, CueEvent, MAX_BYTES
 from .core import Coordinator, FakeSink, CHANNELS
@@ -37,7 +38,15 @@ class _Handler(socketserver.StreamRequestHandler):
             if not raw.endswith(b"\n") or len(raw) > MAX_BYTES + 1:
                 raise ContractError("event: too large or unterminated")
             event = CueEvent.from_json(raw[:-1])
-            response = self.server.coordinator.handle(event)
+            try:
+                permitted = (self.server.event_filter is None or
+                             self.server.event_filter(event) is True)
+            except Exception:
+                permitted = False
+            if not permitted:
+                response = {"result": "rejected", "reason": "receiver_scope", "channels": {}}
+            else:
+                response = self.server.coordinator.handle(event)
         except ContractError as exc:
             response = {"result": "rejected", "reason": str(exc), "channels": {}}
         except (OSError, TimeoutError):
@@ -53,14 +62,18 @@ class LocalServer(socketserver.ThreadingMixIn, getattr(socketserver, "UnixStream
     block_on_close = False
     request_queue_size = 16
 
-    def __init__(self, path: Path, coordinator: Coordinator | None = None):
+    def __init__(self, path: Path, coordinator: Coordinator | None = None,
+                 event_filter: Callable[[CueEvent], bool] | None = None):
         if not hasattr(socket, "AF_UNIX") or not hasattr(os, "getuid"):
             raise RuntimeError("restricted Unix socket hosting is unavailable on this platform")
+        if event_filter is not None and not callable(event_filter):
+            raise ValueError("invalid receiver scope")
         path = Path(path)
         _safe_directory(path.parent)
         if path.exists() or path.is_symlink():
             raise RuntimeError("socket path already exists; stop the other server first")
         self.coordinator = coordinator or Coordinator({channel: FakeSink() for channel in CHANNELS})
+        self.event_filter = event_filter
         self._slots = BoundedSemaphore(16)
         super().__init__(str(path), _Handler)
         os.chmod(path, 0o600)
