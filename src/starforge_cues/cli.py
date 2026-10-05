@@ -47,9 +47,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command in ("printer-cert-probe", "printer-observe"):
-            from .printer_mqtt import (CollectorError, P1ReportNormalizer, SubscribeOnlyP1Client,
-                                       collect_once, default_credential_path, probe_certificate)
+            label = "printer probe" if args.command == "printer-cert-probe" else "printer observer"
             try:
+                from .printer_mqtt import (P1ReportNormalizer, SubscribeOnlyP1Client,
+                                           collect_once, default_credential_path,
+                                           diagnostic_code, probe_certificate)
                 if args.command == "printer-cert-probe":
                     print(probe_certificate(args.host, args.ca_file))
                 else:
@@ -62,8 +64,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             except KeyboardInterrupt:
                 return 0
-            except (CollectorError, OSError, ValueError):
-                print("printer collector stopped: setup, trust, or status unavailable", file=sys.stderr)
+            except ImportError:
+                print(f"{label} failed: dependency_unavailable", file=sys.stderr)
+                return 2
+            except Exception as exc:
+                print(f"{label} failed: {diagnostic_code(exc)}", file=sys.stderr)
                 return 2
         if args.command == "manual-submit":
             from .manual_host import manual_event

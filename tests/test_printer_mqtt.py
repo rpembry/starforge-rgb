@@ -1,17 +1,22 @@
 """Synthetic P1 MQTT and credential tests; no network, printer, or real secret."""
 
 from datetime import datetime, timezone
+import contextlib
+import errno
 import hashlib
+import io
 import json
 from pathlib import Path
 import socket
+import ssl
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from starforge_cues.printer_mqtt import (
-    CollectorError, P1ReportNormalizer, SubscribeOnlyP1Client, _packet,
-    _read_packet, collect_once, parse_fingerprint, read_private_access_code,
-    validate_address,
+    CollectorError, P1ReportNormalizer, SubscribeOnlyP1Client, _open_tls,
+    _packet, _read_packet, collect_once, diagnostic_code, parse_fingerprint,
+    read_private_access_code, validate_address,
 )
 
 
@@ -224,6 +229,60 @@ class TransportTests(unittest.TestCase):
         collect_once(FakeClient(), normalizer, events.append)
         self.assertEqual([event.cue_id for event in events], ["printer.completed"])
         self.assertIsNone(normalizer.last_state_at)
+
+
+class ProbeDiagnosticTests(unittest.TestCase):
+    def test_ca_connect_and_tls_stages_have_distinct_redacted_codes(self):
+        with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                   side_effect=FileNotFoundError("private/path/to/ca")):
+            with self.assertRaises(CollectorError) as caught:
+                _open_tls("192.168.1.2", Path("synthetic-ca"))
+        self.assertEqual(diagnostic_code(caught.exception), "ca_file_missing")
+
+        context = Mock()
+        for failure, expected in (
+                (ConnectionRefusedError(), "connection_refused"),
+                (socket.timeout(), "connection_timeout"),
+                (OSError(errno.ENETUNREACH, "unreachable"), "network_unreachable")):
+            with self.subTest(expected=expected):
+                with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                           return_value=context), patch(
+                               "starforge_cues.printer_mqtt.socket.create_connection",
+                               side_effect=failure):
+                    with self.assertRaises(CollectorError) as caught:
+                        _open_tls("192.168.1.2", Path("synthetic-ca"))
+                self.assertEqual(diagnostic_code(caught.exception), expected)
+
+        raw = Mock()
+        for failure, expected in (
+                (ssl.SSLCertVerificationError(1, "certificate verify failed"),
+                 "tls_ca_validation_failed"),
+                (socket.timeout(), "tls_timeout"),
+                (ssl.SSLError(1, "handshake failed"), "tls_handshake_failed")):
+            with self.subTest(expected=expected):
+                context.wrap_socket.side_effect = failure
+                with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                           return_value=context), patch(
+                               "starforge_cues.printer_mqtt.socket.create_connection",
+                               return_value=raw):
+                    with self.assertRaises(CollectorError) as caught:
+                        _open_tls("192.168.1.2", Path("synthetic-ca"))
+                self.assertEqual(diagnostic_code(caught.exception), expected)
+                raw.close.assert_called()
+
+    def test_cli_probe_prints_only_bounded_category(self):
+        from starforge_cues.cli import main
+        output = io.StringIO()
+        with patch("starforge_cues.printer_mqtt.probe_certificate",
+                   side_effect=CollectorError("tls_ca_validation_failed")):
+            with contextlib.redirect_stderr(output):
+                status = main(["printer-cert-probe", "--host", "192.168.1.2",
+                               "--ca-file", "private/path/to/ca"])
+        self.assertEqual(status, 2)
+        self.assertEqual(output.getvalue().strip(),
+                         "printer probe failed: tls_ca_validation_failed")
+        self.assertEqual(diagnostic_code(CollectorError("private/path/to/secret")),
+                         "mqtt_protocol_or_report_error")
 
 
 if __name__ == "__main__":

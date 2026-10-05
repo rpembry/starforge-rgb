@@ -1,6 +1,7 @@
 """Foreground, subscribe-only P1 status collector. No printer control API."""
 
 from datetime import datetime, timezone
+import errno
 import hashlib
 import ipaddress
 import json
@@ -28,6 +29,41 @@ _PRIVATE_NETS = tuple(ipaddress.ip_network(value) for value in
 
 class CollectorError(ValueError):
     """A generic setup or protocol error that never includes private values."""
+
+
+_DIAGNOSTICS = {
+    "printer address must be a private IPv4 address": "invalid_private_ipv4",
+    "invalid printer serial": "invalid_serial",
+    "invalid peer certificate fingerprint": "invalid_peer_pin",
+    "printer certificate unavailable": "peer_certificate_missing",
+    "printer certificate pin mismatch": "peer_pin_mismatch",
+    "private credential unavailable": "private_credential_unavailable",
+    "credential directory must be owned and mode 0700": "private_credential_permissions",
+    "credential file must be private and bounded": "private_credential_permissions",
+    "credential changed during read": "private_credential_changed",
+    "invalid credential format": "invalid_credential_format",
+    "MQTT connection rejected": "mqtt_connection_rejected",
+    "MQTT subscription rejected": "mqtt_subscription_rejected",
+}
+
+
+def diagnostic_code(exc: Exception) -> str:
+    """Return only fixed categories, never exception details or host paths."""
+    if isinstance(exc, CollectorError):
+        message = str(exc)
+        if message in _DIAGNOSTICS:
+            return _DIAGNOSTICS[message]
+        if message in {
+                "ca_file_missing", "ca_file_unreadable", "ca_file_invalid",
+                "ca_file_unavailable",
+                "connection_refused", "connection_timeout", "network_unreachable",
+                "connection_failed", "tls_ca_validation_failed", "tls_timeout",
+                "tls_handshake_failed", "tls_transport_failed"}:
+            return message
+        return "mqtt_protocol_or_report_error"
+    if isinstance(exc, ImportError):
+        return "dependency_unavailable"
+    return "unexpected_local_error"
 
 
 def validate_address(host: str, serial: str) -> tuple[str, str]:
@@ -246,16 +282,43 @@ def _read_packet(stream) -> tuple[int, bytes]:
 def _open_tls(host: str, ca_file: Path):
     # CA chain validation is required. A separate exact leaf pin replaces DNS
     # hostname validation because the printer is addressed by LAN IP.
-    context = ssl.create_default_context(cafile=str(ca_file))
+    try:
+        context = ssl.create_default_context(cafile=str(ca_file))
+    except FileNotFoundError as exc:
+        raise CollectorError("ca_file_missing") from exc
+    except PermissionError as exc:
+        raise CollectorError("ca_file_unreadable") from exc
+    except (ssl.SSLError, ValueError) as exc:
+        raise CollectorError("ca_file_invalid") from exc
+    except OSError as exc:
+        raise CollectorError("ca_file_unavailable") from exc
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = False
-    raw = socket.create_connection((host, 8883), timeout=15)
+    try:
+        raw = socket.create_connection((host, 8883), timeout=15)
+    except ConnectionRefusedError as exc:
+        raise CollectorError("connection_refused") from exc
+    except TimeoutError as exc:
+        raise CollectorError("connection_timeout") from exc
+    except OSError as exc:
+        code = ("network_unreachable" if exc.errno in
+                {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EHOSTDOWN}
+                else "connection_failed")
+        raise CollectorError(code) from exc
     try:
         wrapped = context.wrap_socket(raw, server_hostname=host)
         wrapped.settimeout(15)
         return wrapped
-    except Exception:
+    except Exception as exc:
         raw.close()
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            raise CollectorError("tls_ca_validation_failed") from exc
+        if isinstance(exc, TimeoutError):
+            raise CollectorError("tls_timeout") from exc
+        if isinstance(exc, ssl.SSLError):
+            raise CollectorError("tls_handshake_failed") from exc
+        if isinstance(exc, OSError):
+            raise CollectorError("tls_transport_failed") from exc
         raise
 
 
