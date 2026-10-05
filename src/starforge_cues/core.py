@@ -335,6 +335,8 @@ class Coordinator:
         if outcome == "accepted":
             self._applied[channel] = None if plan["operation"] == "clear" else plan
             return "accepted"
+        if outcome == "unsupported":
+            return "unsupported"
         # An ambiguous receipt must not be retried automatically.
         return "unknown"
 
