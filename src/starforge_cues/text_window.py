@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
             self.server_thread = None
             self.rendered = None
             self.row_ids = {}
+            self.closed = False
+            self.cleanup = None
 
         def _unlocked(self) -> bool:
             # Failure is private by default. GetActive is read-only; no lock changes.
@@ -116,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
             coordinator.tick()
             view = model.refresh(coordinator.text_snapshot(), unlocked=self._unlocked(),
                                  elapsed=coordinator.monotonic_clock())
+            from .manual_host import with_manual_card
+            view = with_manual_card(view, sinks["text"], model.excluded_sources)
             signature = (view["hidden"], tuple((row["row_id"], row["label"])
                                                for row in view["rows"]),
                          tuple((item["entry_id"], item["revision"], item["recorded_elapsed"])
@@ -146,12 +150,12 @@ def main(argv: list[str] | None = None) -> int:
                 if item["text"] is not None:
                     content.append(self._label(item["text"]))
                 dismiss = Gtk.Button(label="Dismiss indicator")
-                dismiss.connect("clicked", lambda _button, row_id=item["row_id"]:
-                                (model.dismiss(row_id), self._render()))
+                dismiss.connect("clicked", lambda _button, row_id=item["row_id"],
+                                source=item["source_id"]: self._dismiss_row(row_id, source))
                 content.append(dismiss)
                 row.set_child(content)
                 self.live.append(row)
-                self.row_ids[row] = item["row_id"]
+                self.row_ids[row] = (item["row_id"], item["source_id"])
             if view["overflow"]:
                 self.live.append(self._label(f"{view['overflow']} more groups in the bounded snapshot."))
             if view["truncated"]:
@@ -169,22 +173,24 @@ def main(argv: list[str] | None = None) -> int:
             if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
                 row = self.live.get_selected_row()
                 if row in self.row_ids:
-                    model.dismiss(self.row_ids[row])
-                    self._render()
+                    self._dismiss_row(*self.row_ids[row])
                     return True
             return False
 
+        def _dismiss_row(self, row_id: str, source_id: str):
+            model.dismiss(row_id)
+            if source_id == "manual.local":
+                dismiss_manual = getattr(sinks["text"], "dismiss", None)
+                if dismiss_manual is not None:
+                    dismiss_manual()
+            self._render()
+
         def _close(self, *_args):
-            if self.server is not None:
-                self.server.shutdown()
-                self.server.close()
+            if not self.closed:
+                from .manual_host import close_foreground
+                self.cleanup = close_foreground(self.server, sinks.get("audio"))
                 self.server = None
-            audio = sinks.get("audio")
-            if audio is not None:
-                try:
-                    audio.dispatch("audio", {"operation": "clear"})
-                except Exception:
-                    pass  # Cannot claim physical silence from an adapter result.
+                self.closed = True
             return False
 
         def do_activate(self):
@@ -217,6 +223,9 @@ def main(argv: list[str] | None = None) -> int:
             clear = Gtk.Button(label="Clear history")
             clear.connect("clicked", lambda _button: (model.clear_history(), self._render()))
             controls.append(clear)
+            close = Gtk.Button(label="Close window")
+            close.connect("clicked", lambda _button: self.window.close())
+            controls.append(close)
             outer.append(controls)
             self.history = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
             history_scroll = Gtk.ScrolledWindow()
@@ -245,7 +254,11 @@ def main(argv: list[str] | None = None) -> int:
     # Only a generic status is emitted; never print a settings path or cue body.
     print(f"text window mode: {config_status}; manual audio: "
           f"{'armed' if 'audio' in sinks else 'disabled'}")
-    return WindowApp().run([])
+    app = WindowApp()
+    outcome = app.run([])
+    if app.cleanup is not None:
+        print(f"foreground cleanup: {app.cleanup}")
+    return outcome
 
 
 if __name__ == "__main__":

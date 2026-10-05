@@ -15,13 +15,66 @@ from unittest.mock import patch
 
 from starforge_cues.audio import FakeAudioBackend
 from starforge_cues.core import Coordinator, QuietPolicy
-from starforge_cues.manual_host import MANUAL_CUE, manual_event, manual_event_allowed, manual_sinks
+from starforge_cues.manual_host import (MANUAL_CUE, close_foreground, manual_event,
+                                        manual_event_allowed, manual_sinks, with_manual_card)
+from starforge_cues.text_stack import TextStackModel
 from starforge_cues.transport import LocalServer, submit
 
 NOW = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
 
 class ManualHostTests(unittest.TestCase):
+    def test_manual_card_outlives_cue_lease_until_dismissed_without_audio_replay(self):
+        clock = [NOW.timestamp()]
+        backend = FakeAudioBackend(frozenset({"selected.speaker"}),
+                                   monotonic_clock=lambda: clock[0])
+        sinks = manual_sinks("selected.speaker", backend=backend)
+        core = Coordinator(sinks, clock=lambda: clock[0])
+        model = TextStackModel()
+        core.handle(manual_event(instant=NOW, event_id="readable-one"))
+        active = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
+        self.assertEqual(len(with_manual_card(active, sinks["text"], frozenset())["rows"]), 1)
+        self.assertEqual(len(backend.starts), 1)
+        clock[0] += 31
+        core.tick()
+        self.assertEqual(core.text_snapshot()["total"], 0)
+        expired = model.refresh(core.text_snapshot(), unlocked=True, elapsed=clock[0])
+        retained = with_manual_card(expired, sinks["text"], frozenset())
+        self.assertEqual(retained["rows"][0]["text"], "Manual notification test.")
+        self.assertEqual(len(backend.starts), 1)
+        self.assertEqual(with_manual_card({**expired, "hidden": True}, sinks["text"],
+                                          frozenset())["rows"], [])
+        self.assertEqual(with_manual_card(expired, sinks["text"],
+                                          frozenset({"manual.local"}))["rows"], [])
+        sinks["text"].dismiss()
+        self.assertEqual(with_manual_card(expired, sinks["text"], frozenset())["rows"], [])
+
+    def test_normal_close_attempts_socket_and_audio_cleanup_independently(self):
+        class Server:
+            def __init__(self, fail=False):
+                self.fail = fail
+                self.calls = []
+            def shutdown(self):
+                self.calls.append("shutdown")
+                if self.fail:
+                    raise RuntimeError("synthetic failure")
+            def close(self):
+                self.calls.append("close")
+        class Audio:
+            def __init__(self):
+                self.calls = []
+            def dispatch(self, channel, plan):
+                self.calls.append((channel, plan))
+                return "accepted"
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                server, audio = Server(fail), Audio()
+                result = close_foreground(server, audio)
+                self.assertEqual(result["socket"], "unknown" if fail else "closed")
+                self.assertEqual(result["audio"], "accepted")
+                self.assertIn("close", server.calls)
+                self.assertEqual(audio.calls, [("audio", {"operation": "clear"})])
+
     def test_manual_event_drives_text_and_only_selected_fake_audio(self):
         backend = FakeAudioBackend(frozenset({"selected.speaker", "other.speaker"}),
                                    monotonic_clock=lambda: NOW.timestamp())
