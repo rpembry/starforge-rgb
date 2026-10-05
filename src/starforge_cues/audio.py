@@ -145,6 +145,14 @@ class AudioAdapter:
 
     def _stop(self) -> str:
         if self._active_token is None:
+            # Real backends own any process even when its start receipt was
+            # lost. They must establish quiescence; elapsed clip time cannot.
+            quiesce = getattr(self.backend, "quiesce_unknown", None)
+            if quiesce is not None:
+                try:
+                    return "accepted" if quiesce() == "accepted" else "unknown"
+                except Exception:
+                    return "unknown"
             return "unknown" if self.monotonic_clock() < self._uncertain_until else "accepted"
         outcome = self.backend.stop(self.selected_sink, self._active_token, FADE_MS)
         if outcome == "accepted":
