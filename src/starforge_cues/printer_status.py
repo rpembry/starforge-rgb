@@ -106,10 +106,16 @@ class BambuCompletionAdapter:
             return PrinterDecision("suppressed", "paused")
         # A terminal snapshot alone, or one after reconnect/unknown, proves no
         # transition. Require this exact job to have been seen printing here.
-        if item.job_id in self._terminal:
-            return PrinterDecision("suppressed", "duplicate_terminal")
         if item.job_id != self._active_job:
-            return PrinterDecision("suppressed", "unproven_terminal")
+            # A fresh terminal for a different job contradicts our belief that
+            # the previous job is still current. Drop that evidence: a later
+            # terminal for the old job cannot be called a proven transition.
+            self._active_job = None
+            return PrinterDecision("suppressed", "duplicate_terminal" if item.job_id in self._terminal
+                                   else "unproven_terminal")
+        if item.job_id in self._terminal:
+            self._active_job = None
+            return PrinterDecision("suppressed", "duplicate_terminal")
         self._active_job = None
         self._terminal[item.job_id] = None
         if len(self._terminal) > 256:

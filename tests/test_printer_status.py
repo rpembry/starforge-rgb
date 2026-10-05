@@ -82,12 +82,39 @@ class PrinterCompletionTests(unittest.TestCase):
         adapter.observe(report(2, "printing", "new-run"))
         self.assertEqual(adapter.observe(report(3, "finished", "abandoned")).reason,
                          "unproven_terminal")
-        completed = adapter.observe(report(4, "finished", "new-run")).event
+        self.assertEqual(adapter.observe(report(4, "finished", "new-run")).reason,
+                         "unproven_terminal")
+        adapter.observe(report(5, "printing", "new-run"))
+        completed = adapter.observe(report(6, "finished", "new-run")).event
         self.assertLessEqual(len(completed.event_id), 80)
         self.assertEqual(completed.event_id, completed.idempotency_key)
-        self.assertEqual(adapter.observe(report(5, "failed", "new-run")).reason,
+        self.assertEqual(adapter.observe(report(7, "failed", "new-run")).reason,
                          "duplicate_terminal")
         self.assertLessEqual(len(adapter._terminal), 256)
+
+    def test_conflicting_terminal_invalidates_old_active_job(self):
+        for conflict in ("finished", "failed"):
+            with self.subTest(conflict=conflict):
+                adapter = self.make_adapter()
+                adapter.observe(report(1, "printing", "job-A"))
+                self.assertEqual(adapter.observe(report(2, conflict, "job-B")).reason,
+                                 "unproven_terminal")
+                self.assertEqual(adapter.observe(report(3, "finished", "job-A")).reason,
+                                 "unproven_terminal")
+                adapter.observe(report(4, "printing", "job-A"))
+                self.assertEqual(adapter.observe(report(5, "finished", "job-A")).outcome,
+                                 "emitted")
+
+    def test_old_or_reordered_conflict_cannot_override_new_evidence(self):
+        adapter = self.make_adapter()
+        adapter.observe(report(1, "printing", "old", epoch=1))
+        adapter.observe(report(1, "printing", "current", epoch=2))
+        self.assertEqual(adapter.observe(report(2, "finished", "old", epoch=1)).reason,
+                         "old_connection")
+        self.assertEqual(adapter.observe(report(1, "failed", "other", epoch=2)).reason,
+                         "out_of_order")
+        self.assertEqual(adapter.observe(report(2, "finished", "current", epoch=2)).outcome,
+                         "emitted")
 
     def test_strict_normalized_contract(self):
         for value in (True, 0, 2**31):
