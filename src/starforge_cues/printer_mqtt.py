@@ -116,15 +116,24 @@ class P1ReportNormalizer:
         self.epoch = 0
         self.sequence = 0
         self.last_state_at: float | None = None
+        self.is_connected = False
 
     def connected(self) -> None:
+        if self.is_connected:
+            raise CollectorError("collector is already connected")
         if self.epoch >= 2**31 - 1:
             raise CollectorError("connection epoch exhausted")
         self.epoch += 1
         self.sequence = 0
         self.last_state_at = None
+        self.is_connected = True
 
     def disconnected(self) -> None:
+        if self.is_connected:
+            # Erase the adapter's active-job proof before any delayed callback
+            # can arrive. The next connection also starts a new epoch.
+            self._observe("unknown", None)
+            self.is_connected = False
         self.last_state_at = None
 
     def _observe(self, state: str, job_id: str | None) -> PrinterDecision:
@@ -134,7 +143,7 @@ class P1ReportNormalizer:
             self.epoch, self.sequence, instant, state, job_id))
 
     def accept(self, raw: bytes) -> PrinterDecision:
-        if self.epoch == 0:
+        if not self.is_connected:
             raise CollectorError("collector is disconnected")
         if not isinstance(raw, bytes) or len(raw) > MAX_REPORT:
             self.last_state_at = None

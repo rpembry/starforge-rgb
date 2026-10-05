@@ -60,6 +60,20 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.normalizer.accept(report("FINISH", "fourth-task")).reason,
                          "unproven_terminal")
 
+    def test_disconnect_rejects_delayed_terminal_until_fresh_printing(self):
+        self.normalizer.accept(report("RUNNING", "old-task"))
+        old_epoch = self.normalizer.epoch
+        self.normalizer.disconnected()
+        with self.assertRaisesRegex(CollectorError, "disconnected"):
+            self.normalizer.accept(report("FINISH", "old-task"))
+        self.normalizer.connected()
+        self.assertGreater(self.normalizer.epoch, old_epoch)
+        self.assertEqual(self.normalizer.accept(report("FINISH", "old-task")).reason,
+                         "unproven_terminal")
+        self.normalizer.accept(report("RUNNING", "new-task"))
+        self.assertEqual(self.normalizer.accept(report("FINISH", "new-task")).outcome,
+                         "emitted")
+
     def test_partial_missing_task_and_failure_remain_unknown(self):
         self.normalizer.accept(report("RUNNING"))
         self.assertEqual(self.normalizer.accept(b'{"print":{"mc_percent":42}}').reason,
@@ -165,6 +179,20 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(next(client.reports()), report("RUNNING"))
         self.assertEqual([packet[0] for packet in stream.sent], [0x10, 0x82, 0xE0])
         self.assertTrue(stream.closed)
+
+    def test_idle_heartbeat_and_second_timeout_end_session(self):
+        class SilentTLS(FakeTLS):
+            def recv(self, size):
+                if not self.inbound:
+                    raise socket.timeout()
+                return super().recv(size)
+
+        stream = SilentTLS(b"trusted", b"\x20\x02\x00\x00\x90\x03\x00\x01\x00")
+        client = self.make_client(stream, hashlib.sha256(b"trusted").hexdigest())
+        with client:
+            with self.assertRaisesRegex(CollectorError, "heartbeat timed out"):
+                next(client.reports())
+        self.assertEqual([packet[0] for packet in stream.sent], [0x10, 0x82, 0xC0, 0xE0])
 
     def test_packet_bound_and_semantic_callback_seam(self):
         stream = FakeTLS(b"trusted", b"\x30\xff\xff\x7f")
