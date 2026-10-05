@@ -22,7 +22,8 @@ MAX_WAV_BYTES = 1024 * 1024
 MAX_CLIPS = 16
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_DURATION_MS = 500
-MAX_GAIN = 0.05
+DEFAULT_GAIN = 0.05
+MAX_GAIN = 0.15  # hard ceiling for explicit, one-off commissioning
 FADE_MS = 50
 _SINK_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,159}\Z")
 _CUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}\Z")
@@ -121,12 +122,15 @@ class AudioAdapter:
     capabilities = frozenset({"audio"})
 
     def __init__(self, backend: AudioBackend, selected_sink: str,
-                 clips: dict[str, AudioClip], *, gain: float = MAX_GAIN,
+                 clips: dict[str, AudioClip], *, gain: float = DEFAULT_GAIN,
+                 commissioning_override: bool = False,
                  monotonic_clock: Callable[[], float] | None = None):
         import time
         if not isinstance(selected_sink, str) or not _SINK_ID.fullmatch(selected_sink):
             raise ValueError("invalid selected audio sink")
-        if (type(gain) not in (int, float) or not 0 <= gain <= MAX_GAIN or
+        if (type(commissioning_override) is not bool or
+                type(gain) not in (int, float) or
+                not 0 <= gain <= (MAX_GAIN if commissioning_override else DEFAULT_GAIN) or
                 not isinstance(clips, dict) or len(clips) > MAX_CLIPS or
                 any(not isinstance(cue, str) or not _CUE_ID.fullmatch(cue) or
                     not isinstance(clip, AudioClip) for cue, clip in clips.items()) or

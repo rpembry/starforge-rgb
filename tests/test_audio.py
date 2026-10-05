@@ -12,7 +12,7 @@ import wave
 
 from starforge_cues import Coordinator, CueEvent, FakeSink, QuietPolicy
 from starforge_cues.audio import (AudioAdapter, AudioAssetError, AudioClip,
-                                  FakeAudioBackend, MAX_GAIN, load_audio_clips,
+                                  DEFAULT_GAIN, FakeAudioBackend, MAX_GAIN, load_audio_clips,
                                   original_test_earcon)
 from starforge_cues.themes import ThemeError
 
@@ -71,6 +71,26 @@ class AudioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AudioAdapter(FakeAudioBackend(frozenset({SELECTED})), SELECTED,
                          {"job.completed": clip}, gain=MAX_GAIN + 0.001)
+
+    def test_commissioning_gain_requires_explicit_override_and_hard_cap(self):
+        clip = original_test_earcon()
+        backend = FakeAudioBackend(frozenset({SELECTED}))
+        default = AudioAdapter(backend, SELECTED, {"job.completed": clip})
+        self.assertEqual(default.gain, DEFAULT_GAIN)
+        for gain in (0.15, MAX_GAIN + 0.001, float("nan")):
+            with self.assertRaises(ValueError):
+                AudioAdapter(backend, SELECTED, {"job.completed": clip}, gain=gain)
+        with self.assertRaises(ValueError):
+            AudioAdapter(backend, SELECTED, {"job.completed": clip}, gain=0.15,
+                         commissioning_override="true")
+        with self.assertRaises(ValueError):
+            AudioAdapter(backend, SELECTED, {"job.completed": clip}, gain=MAX_GAIN + 0.001,
+                         commissioning_override=True)
+        selected = AudioAdapter(backend, SELECTED, {"job.completed": clip}, gain=0.15,
+                                commissioning_override=True)
+        self.assertEqual(selected.dispatch("audio", {"operation": "cue",
+                                                      "cue_id": "job.completed"}), "accepted")
+        self.assertEqual(backend.starts[-1][2], 0.15)
 
     def test_data_only_theme_asset_is_revalidated_before_use(self):
         clip = original_test_earcon()
