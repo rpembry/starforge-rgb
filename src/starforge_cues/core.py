@@ -392,6 +392,40 @@ class Coordinator:
             policy = self._sync_policy()
             return state if state["result"] != "unchanged" else policy
 
+    def text_snapshot(self, limit: int = 32) -> dict:
+        """Bounded read-only projection of active leases for a local text view.
+
+        The coordinator remains the sole owner of cue lifetimes and priority.
+        Call tick separately to dispatch expiry transitions to output sinks.
+        """
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise ValueError("text snapshot limit must be within 1..32")
+        with self._lock:
+            if not self.policy.permits("text", self.clock()):
+                return {"quiet": True, "total": 0, "source_totals": {},
+                        "active_revisions": [], "entries": []}
+            now = self.monotonic_clock()
+            live = [(key, lease) for key, lease in self._leases.items() if lease.expiry > now]
+            live.sort(key=lambda item: (item[1].priority, item[1].sequence), reverse=True)
+            source_totals: dict[str, int] = {}
+            active_revisions = []
+            for key, lease in live:
+                source = lease.plan["source_id"]
+                source_totals[source] = source_totals.get(source, 0) + 1
+                active_revisions.append((f"{key[0]}/{key[1]}", lease.sequence))
+            entries = []
+            for key, lease in live[:limit]:
+                plan = lease.plan
+                entries.append({"entry_id": f"{key[0]}/{key[1]}", "revision": lease.sequence,
+                                "source_id": plan["source_id"],
+                                "subject_id": plan["subject_id"], "cue_id": plan["cue_id"],
+                                "status": plan["status"], "severity": plan["severity"],
+                                "confidence": plan["confidence"], "text": plan["text"],
+                                "occurred_at": plan["occurred_at"], "expires_at": plan["expires_at"],
+                                "group": plan["group"], "count": plan["count"]})
+            return {"quiet": False, "total": len(live), "source_totals": source_totals,
+                    "active_revisions": active_revisions, "entries": entries}
+
     def _remember(self, key: tuple[str, str], event_key: tuple[str, str],
                   expiry: float, event: CueEvent) -> None:
         if len(self._seen) >= 4096:
@@ -475,7 +509,8 @@ class Coordinator:
         plan = {"operation": "cue", "cue_id": event.cue_id, "status": event.status,
                 "severity": event.severity, "source_id": event.source_id,
                 "confidence": event.confidence, "subject_id": event.subject_id,
-                "text": event.text,
+                "text": event.text, "occurred_at": event.occurred_at.isoformat(),
+                "group": event.metadata.get("group"), "count": event.metadata.get("count"),
                 "expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat(),
                 "baseline": event.cue_id}
         self._leases[lease_key] = _Lease(deadline, first_seen, renewals, {"info": 1, "warning": 2,
