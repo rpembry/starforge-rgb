@@ -1,4 +1,4 @@
-"""No physical outputs: dry-run and fake-output UDS host only."""
+"""Portable dry-run, restricted local transport, and explicit manual submit."""
 
 import argparse
 from datetime import datetime, timezone
@@ -18,7 +18,7 @@ def _raw(path: str) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Synthetic semantic cue host (no real outputs)")
+    parser = argparse.ArgumentParser(description="Local semantic cue tools; outputs depend on the foreground host")
     commands = parser.add_subparsers(dest="command", required=True)
     dry = commands.add_parser("dry-run", help="resolve one event locally with fake sinks")
     dry.add_argument("--file", required=True, help="JSON event file or - for stdin")
@@ -28,13 +28,24 @@ def main(argv: list[str] | None = None) -> int:
     preview.add_argument("--directory", type=Path, required=True)
     preview.add_argument("--file", required=True)
     preview.add_argument("--rgb-cap", type=float, default=1.0)
-    send = commands.add_parser("submit", help="send to local fake-output host")
+    send = commands.add_parser("submit", help="send a file event to a local host")
     send.add_argument("--file", required=True)
     send.add_argument("--socket", type=Path)
+    manual = commands.add_parser("manual-submit", help="submit one fresh synthetic manual notification")
+    manual.add_argument("--socket", type=Path)
     serve = commands.add_parser("serve", help="host fake outputs on a restricted Unix socket")
     serve.add_argument("--socket", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "manual-submit":
+            from .manual_host import manual_event
+            from .transport import default_socket, submit
+            event = manual_event()
+            payload = {**event.__dict__, "occurred_at": event.occurred_at.isoformat(),
+                       "observed_at": event.observed_at.isoformat()}
+            result = submit(args.socket or default_socket(), json.dumps(payload).encode("utf-8"))
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if result["result"] == "accepted" else 2
         if args.command == "serve":
             from .transport import LocalServer, default_socket
             path = args.socket or default_socket()
