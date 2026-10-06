@@ -232,6 +232,81 @@ class TransportTests(unittest.TestCase):
 
 
 class ProbeDiagnosticTests(unittest.TestCase):
+    def test_legacy_ca_option_is_explicit_and_preserves_ca_verification(self):
+        flags = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                context = Mock()
+                context.verify_flags = flags
+                context.verify_mode = ssl.CERT_REQUIRED
+                context.wrap_socket.return_value = Mock()
+                with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                           return_value=context) as create, patch(
+                               "starforge_cues.printer_mqtt.socket.create_connection"):
+                    _open_tls("192.168.1.2", Path("synthetic-ca"),
+                              bambu_legacy_ca=enabled)
+                create.assert_called_once_with(cafile="synthetic-ca")
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertEqual(context.verify_flags,
+                                 flags & ~ssl.VERIFY_X509_STRICT if enabled else flags)
+                self.assertFalse(context.check_hostname)
+                self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_legacy_ca_still_rejects_bad_chain_and_expiry_before_secret(self):
+        for verify_code in (20, 10):  # issuer unavailable, certificate expired
+            with self.subTest(verify_code=verify_code):
+                failure = ssl.SSLCertVerificationError(1, "synthetic certificate failure")
+                failure.verify_code = verify_code
+                context = Mock()
+                context.verify_flags = ssl.VERIFY_X509_STRICT
+                context.wrap_socket.side_effect = failure
+                raw = Mock()
+                client = SubscribeOnlyP1Client(
+                    "192.168.1.2", "01P0000000000000", Path("synthetic-ca"),
+                    hashlib.sha256(b"expected-leaf").hexdigest(), Path("unused-secret"),
+                    credential_loader=lambda _: self.fail("secret read before valid TLS"),
+                    bambu_legacy_ca=True)
+                with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                           return_value=context), patch(
+                               "starforge_cues.printer_mqtt.socket.create_connection",
+                               return_value=raw):
+                    with self.assertRaises(CollectorError) as caught:
+                        client.__enter__()
+                self.assertEqual(diagnostic_code(caught.exception),
+                                 f"tls_ca_validation_failed_x509_{verify_code}")
+                raw.close.assert_called_once()
+
+    def test_legacy_ca_still_requires_exact_leaf_pin_before_secret(self):
+        stream = FakeTLS(b"different-leaf")
+        def opener(_host, _ca_file, *, bambu_legacy_ca):
+            self.assertIs(bambu_legacy_ca, True)
+            return stream
+        client = SubscribeOnlyP1Client(
+            "192.168.1.2", "01P0000000000000", Path("synthetic-ca"),
+            hashlib.sha256(b"expected-leaf").hexdigest(), Path("unused-secret"),
+            tls_opener=opener,
+            credential_loader=lambda _: self.fail("secret read before pin"),
+            bambu_legacy_ca=True)
+        with self.assertRaises(CollectorError) as caught:
+            client.__enter__()
+        self.assertEqual(diagnostic_code(caught.exception), "peer_pin_mismatch")
+        self.assertEqual(stream.sent, [])
+        self.assertTrue(stream.closed)
+
+    def test_cli_legacy_ca_flag_is_explicit(self):
+        from starforge_cues.cli import main
+        for flagged in (False, True):
+            with self.subTest(flagged=flagged):
+                argv = ["printer-cert-probe", "--host", "192.168.1.2",
+                        "--ca-file", "synthetic-ca"]
+                if flagged:
+                    argv.append("--bambu-legacy-ca")
+                with patch("starforge_cues.printer_mqtt.probe_certificate",
+                           return_value="0" * 64) as probe, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(argv), 0)
+                probe.assert_called_once_with("192.168.1.2", Path("synthetic-ca"),
+                                              bambu_legacy_ca=flagged)
+
     def test_ca_connect_and_tls_stages_have_distinct_redacted_codes(self):
         with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
                    side_effect=FileNotFoundError("private/path/to/ca")):

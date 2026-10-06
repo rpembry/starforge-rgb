@@ -285,7 +285,7 @@ def _read_packet(stream) -> tuple[int, bytes]:
     raise CollectorError("invalid MQTT length")
 
 
-def _open_tls(host: str, ca_file: Path):
+def _open_tls(host: str, ca_file: Path, *, bambu_legacy_ca: bool = False):
     # CA chain validation is required. A separate exact leaf pin replaces DNS
     # hostname validation because the printer is addressed by LAN IP.
     try:
@@ -298,6 +298,10 @@ def _open_tls(host: str, ca_file: Path):
         raise CollectorError("ca_file_invalid") from exc
     except OSError as exc:
         raise CollectorError("ca_file_unavailable") from exc
+    if bambu_legacy_ca is True:
+        # Explicit printer-only compatibility for Bambu CA certificates that
+        # fail Python 3.13+ strict X.509 profile checks. CA verification stays on.
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = False
     try:
@@ -329,10 +333,11 @@ def _open_tls(host: str, ca_file: Path):
         raise
 
 
-def probe_certificate(host: str, ca_file: Path, *, tls_opener=_open_tls) -> str:
+def probe_certificate(host: str, ca_file: Path, *, bambu_legacy_ca: bool = False,
+                      tls_opener=_open_tls) -> str:
     """Return a CA-validated leaf fingerprint without reading credentials."""
     host, _ = validate_address(host, "000000000000")
-    with tls_opener(host, ca_file) as stream:
+    with tls_opener(host, ca_file, **({"bambu_legacy_ca": True} if bambu_legacy_ca is True else {})) as stream:
         certificate = stream.getpeercert(binary_form=True)
         if not certificate:
             raise CollectorError("printer certificate unavailable")
@@ -344,18 +349,22 @@ class SubscribeOnlyP1Client:
 
     def __init__(self, host: str, serial: str, ca_file: Path, peer_sha256: str,
                  credential_file: Path, *, tls_opener=_open_tls,
-                 credential_loader=read_private_access_code):
+                 credential_loader=read_private_access_code,
+                 bambu_legacy_ca: bool = False):
         self.host, self.serial = validate_address(host, serial)
         self.ca_file = Path(ca_file)
         self.peer_pin = parse_fingerprint(peer_sha256)
         self.credential_file = Path(credential_file)
         self.tls_opener = tls_opener
         self.credential_loader = credential_loader
+        self.bambu_legacy_ca = bambu_legacy_ca
         self.stream = None
         self.topic = f"device/{self.serial}/report".encode("ascii")
 
     def __enter__(self):
-        stream = self.tls_opener(self.host, self.ca_file)
+        stream = self.tls_opener(
+            self.host, self.ca_file,
+            **({"bambu_legacy_ca": True} if self.bambu_legacy_ca is True else {}))
         try:
             certificate = stream.getpeercert(binary_form=True)
             if not certificate or not secrets.compare_digest(

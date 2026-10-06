@@ -38,10 +38,14 @@ def main(argv: list[str] | None = None) -> int:
     probe = commands.add_parser("printer-cert-probe", help="CA-validated P1 certificate fingerprint; no credential")
     probe.add_argument("--host", required=True, help="printer private IPv4 address")
     probe.add_argument("--ca-file", type=Path, required=True, help="trusted Bambu CA PEM")
+    probe.add_argument("--bambu-legacy-ca", action="store_true",
+                       help="explicit Bambu CA compatibility; retain CA verification")
     observe = commands.add_parser("printer-observe", help="foreground P1 report subscription; generic console cues only")
     observe.add_argument("--host", required=True, help="printer private IPv4 address")
     observe.add_argument("--serial", required=True, help="printer serial from its settings screen")
     observe.add_argument("--ca-file", type=Path, required=True, help="trusted Bambu CA PEM")
+    observe.add_argument("--bambu-legacy-ca", action="store_true",
+                         help="explicit Bambu CA compatibility; retain CA verification")
     observe.add_argument("--peer-sha256", required=True, help="confirmed leaf certificate fingerprint")
     observe.add_argument("--credential-file", type=Path, help="owned private access-code file")
     args = parser.parse_args(argv)
@@ -53,11 +57,13 @@ def main(argv: list[str] | None = None) -> int:
                                            collect_once, default_credential_path,
                                            diagnostic_code, probe_certificate)
                 if args.command == "printer-cert-probe":
-                    print(probe_certificate(args.host, args.ca_file))
+                    print(probe_certificate(args.host, args.ca_file,
+                                            bambu_legacy_ca=args.bambu_legacy_ca))
                 else:
                     client = SubscribeOnlyP1Client(
                         args.host, args.serial, args.ca_file, args.peer_sha256,
-                        args.credential_file or default_credential_path())
+                        args.credential_file or default_credential_path(),
+                        bambu_legacy_ca=args.bambu_legacy_ca)
                     normalizer = P1ReportNormalizer(args.serial)
                     collect_once(client, normalizer,
                                  lambda event: print(f"semantic cue: {event.cue_id}", flush=True))
