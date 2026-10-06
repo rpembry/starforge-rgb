@@ -172,6 +172,7 @@ class P1ReportNormalizer:
         if self.epoch >= 2**31 - 1:
             raise CollectorError("connection epoch exhausted")
         self.epoch += 1
+        self.adapter.invalidate_active_proof()
         self.sequence = 0
         self.last_state_at = None
         self.last_known_state = None
@@ -189,6 +190,11 @@ class P1ReportNormalizer:
         self.last_state_at = None
 
     def _observe(self, state: str, job_id: str | None) -> PrinterDecision:
+        # Monotonic gap/lease and contradiction decisions must erase proof even
+        # if the adapter rejects this observation after a wall-clock rollback.
+        if (state in ("unknown", "idle") or
+                (job_id is not None and self.adapter.active_job_id not in (None, job_id))):
+            self.adapter.invalidate_active_proof()
         self.sequence += 1
         instant = datetime.fromtimestamp(self.clock(), timezone.utc)
         return self.adapter.observe(PrinterObservation(

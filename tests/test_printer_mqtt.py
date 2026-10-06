@@ -149,6 +149,47 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.normalizer.accept(report("FINISH", "first-task")).reason,
                          "unproven_terminal")
 
+    def test_invalidation_survives_wall_clock_rollback(self):
+        for path in ("packet_gap", "state_lease", "invalid_json", "invalid_shape",
+                     "unsupported_state", "idle", "conflicting_delta",
+                     "different_terminal", "reconnect"):
+            with self.subTest(path=path):
+                wall = Clock()
+                monotonic = Clock()
+                normalizer = P1ReportNormalizer(
+                    "01P0000000000000", clock=lambda: wall.value,
+                    monotonic=lambda: monotonic.value)
+                normalizer.connected()
+                normalizer.accept(report("RUNNING", "first-task"))
+                wall.tick(-120)
+                if path == "packet_gap":
+                    monotonic.tick(61)
+                    normalizer.accept(b'{"print":{"mc_percent":42}}')
+                elif path == "state_lease":
+                    monotonic.tick(MAX_STATE_LEASE_S + 1)
+                    normalizer.last_input_at = monotonic.value - 1  # recent delta stream
+                    normalizer.accept(b'{"print":{"mc_percent":42}}')
+                elif path == "invalid_json":
+                    with self.assertRaises(CollectorError):
+                        normalizer.accept(b'{"print":')
+                elif path == "invalid_shape":
+                    normalizer.accept(b'{"print":[]}')
+                elif path == "unsupported_state":
+                    normalizer.accept(report("OFFLINE", "first-task"))
+                elif path == "idle":
+                    normalizer.accept(report("IDLE", "first-task"))
+                elif path == "conflicting_delta":
+                    normalizer.accept(b'{"print":{"task_id":"other-task"}}')
+                elif path == "different_terminal":
+                    normalizer.accept(report("FINISH", "other-task"))
+                else:
+                    normalizer.disconnected()
+                    normalizer.connected()
+                self.assertIsNone(normalizer.adapter.active_job_id)
+                wall.tick(240)
+                monotonic.tick(1)
+                self.assertIsNone(normalizer.accept(report("FINISH", "first-task")).event)
+
 
 class CredentialTests(unittest.TestCase):
     def test_private_file_and_rejected_metadata(self):
