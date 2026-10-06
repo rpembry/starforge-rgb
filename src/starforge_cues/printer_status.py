@@ -84,12 +84,13 @@ class BambuCompletionAdapter:
             self._last_observed = float("-inf")
             self._active_job = None  # reconnect cannot prove an unseen ending
         observed = item.observed_at.timestamp()
+        if item.sequence <= self._sequence or observed < self._last_observed:
+            # An older report cannot establish a gap after the latest proof.
+            return PrinterDecision("suppressed", "out_of_order")
         age = self.clock() - observed
         if not -5 <= age <= self.max_age_s:
             self._active_job = None  # a freshness gap breaks transition proof
             return PrinterDecision("suppressed", "stale_or_future")
-        if item.sequence <= self._sequence or observed < self._last_observed:
-            return PrinterDecision("suppressed", "out_of_order")
         self._sequence = item.sequence
         self._last_observed = observed
 
