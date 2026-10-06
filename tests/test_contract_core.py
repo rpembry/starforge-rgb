@@ -219,6 +219,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["plan"]["operation"], "clear")
         self.assertIsNone(sinks["rgb"].state["rgb"])
         self.assertLessEqual(len(core._seen), 4096)
+        self.assertIn((original.source_id, original.idempotency_key), core._seen)
 
     def test_redacted_unknown_fields_and_metadata(self):
         attacker_key = "x" * 2000

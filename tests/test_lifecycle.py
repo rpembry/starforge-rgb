@@ -134,19 +134,87 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(core.handle(event(clock[0], event_id="new", idempotency_key="new",
                                            subject_id="run-two", status="started"))["result"], "accepted")
 
-    def test_retired_and_active_capacity_keeps_cancellation_available(self):
+    def test_cancel_transfers_reserved_subject_slot_at_capacity(self):
         clock = [NOW]
         core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
         core.handle(event(clock[0], event_id="active", idempotency_key="active",
                           subject_id="run-one"))
-        for index in range(4095):
+        for index in range(2047):
             core._retired_subjects[("other.source", f"subject:retired-{index}")] = NOW + 600
         cancel = core.handle(event(clock[0], event_id="stop", idempotency_key="stop",
                                    subject_id="run-one", status="cancelled"))
         self.assertEqual(cancel["result"], "accepted")
-        self.assertLessEqual(len(core._retired_subjects) + len(core._leases), 4096)
+        self.assertEqual(len(core._retired_subjects), 2048)
         self.assertEqual(core.handle(event(clock[0], event_id="next", idempotency_key="next",
                                            subject_id="run-two"))["reason"], "capacity")
+        self.assertIn(("other.source", "subject:retired-0"), core._retired_subjects)
+        self.assertEqual(core.handle(event(clock[0], event_id="one-shot",
+                                           idempotency_key="one-shot", subject_id=None))["result"],
+                         "accepted")
+
+    def test_active_generation_keeps_original_age_at_subject_capacity(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        core.handle(event(clock[0], event_id="first", idempotency_key="first",
+                          subject_id="protected", status="started"))
+        for index in range(2047):
+            core._retired_subjects[("other.source", f"subject:retired-{index}")] = NOW + 600
+        clock[0] += 200
+        renewed = core.handle(event(clock[0], event_id="renew", idempotency_key="renew",
+                                    subject_id="protected", status="progress"))
+        self.assertEqual(renewed["result"], "accepted")
+        self.assertEqual(core._leases[("synthetic.build", "subject:protected")].first_seen, NOW)
+        self.assertEqual(core._leases[("synthetic.build", "subject:protected")].expiry, NOW + 300)
+        clock[0] += 101
+        core.tick()
+        self.assertEqual(core.handle(event(clock[0], event_id="resume", idempotency_key="resume",
+                                           subject_id="protected", status="progress"))["reason"],
+                         "lease_limit")
+
+    def test_unknown_cancellation_flood_preserves_replay_record(self):
+        clock = [NOW]
+        audio = FakeSink()
+        core = Coordinator({"audio": audio}, clock=lambda: clock[0])
+        original = event(clock[0], event_id="original", idempotency_key="original",
+                         subject_id="real", ttl_ms=300000)
+        self.assertEqual(core.handle(original)["result"], "accepted")
+        sound_count = len(audio.calls)
+        for index in range(4096):
+            missing = event(clock[0], event_id=f"cancel-{index}",
+                            idempotency_key=f"cancel-{index}", source_id="other.source",
+                            subject_id=f"missing-{index}", status="cancelled", ttl_ms=300000)
+            self.assertEqual(core.handle(missing)["reason"], "unknown_subject")
+        self.assertEqual(len(core._seen), 1)
+        self.assertEqual(core.handle(original)["reason"], "duplicate")
+        self.assertEqual(len(audio.calls), sound_count)
+
+    def test_short_lived_subject_churn_cannot_reset_unexpired_generation(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        for index in range(2048):
+            identifier = f"short-{index}"
+            self.assertEqual(core.handle(event(clock[0], event_id=identifier,
+                                               idempotency_key=identifier,
+                                               source_id=f"source-{index % 256}",
+                                               subject_id=identifier, ttl_ms=1))["result"], "accepted")
+            clock[0] += 0.002
+        core.tick()
+        self.assertEqual(len(core._retired_subjects), 2048)
+        self.assertEqual(core.handle(event(clock[0], event_id="over-cap",
+                                           idempotency_key="over-cap", source_id="source-0",
+                                           subject_id="new-run", ttl_ms=1))["reason"], "capacity")
+        self.assertIn(("source-0", "subject:short-0"), core._retired_subjects)
+        self.assertEqual(core.handle(event(clock[0], event_id="old-id",
+                                           idempotency_key="old-id", source_id="source-0",
+                                           subject_id="short-0"))["reason"], "lease_limit")
+        self.assertEqual(core.handle(event(clock[0], event_id="fresh", idempotency_key="fresh",
+                                           source_id="source-0", subject_id=None,
+                                           ttl_ms=1))["result"], "accepted")
+        clock[0] += 601
+        core.tick()
+        self.assertEqual(core.handle(event(clock[0], event_id="after-horizon",
+                                           idempotency_key="after-horizon", source_id="source-0",
+                                           subject_id="short-0"))["result"], "accepted")
 
     def test_expired_one_shots_do_not_starve_unrelated_traffic(self):
         clock = [NOW]
