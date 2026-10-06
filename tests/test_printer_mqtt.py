@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 from starforge_cues.printer_mqtt import (
     CollectorError, P1ReportNormalizer, SubscribeOnlyP1Client, _open_tls,
-    _packet, _read_packet, collect_once, diagnostic_code, parse_fingerprint,
+    MAX_STATE_LEASE_S, _packet, _read_packet, collect_once, diagnostic_code, parse_fingerprint,
     read_private_access_code, validate_address,
 )
 
@@ -57,7 +57,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.normalizer.accept(report("FINISH", "second-task")).reason,
                          "unproven_terminal")
         self.normalizer.accept(report("RUNNING", "third-task"))
-        self.clock.tick(21)
+        self.clock.tick(61)
         self.assertEqual(self.normalizer.accept(report("FINISH", "third-task")).reason,
                          "unproven_terminal")
         self.normalizer.accept(report("RUNNING", "fourth-task"))
@@ -104,6 +104,49 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(CollectorError):
             self.normalizer.accept(b"x" * 16385)
         self.assertEqual(self.normalizer.accept(report("FINISH", "three")).reason,
+                         "unproven_terminal")
+
+    def test_sparse_delta_reports_preserve_only_bounded_active_proof(self):
+        self.assertEqual(self.normalizer.accept(b'{"print":{"mc_percent":42}}').reason,
+                         "no_state")
+        self.assertEqual(self.normalizer.accept(report("FINISH")).reason,
+                         "unproven_terminal")
+        self.assertEqual(self.normalizer.accept(report("RUNNING")).reason, "active")
+        for _ in range(43):
+            self.clock.tick(2)
+            self.assertEqual(self.normalizer.accept(b'{"print":{"mc_percent":42}}').reason,
+                             "no_state")
+        self.clock.tick(2)
+        self.assertEqual(self.normalizer.accept(report("FINISH")).outcome, "emitted")
+
+        self.normalizer.disconnected()
+        self.normalizer.connected()
+        self.normalizer.accept(b'{"print":{"mc_percent":42}}')
+        self.assertEqual(self.normalizer.accept(report("FINISH")).reason,
+                         "duplicate_terminal")
+
+    def test_packet_gap_and_state_lease_expire_partial_delta_proof(self):
+        self.normalizer.accept(report("RUNNING"))
+        self.clock.tick(61)
+        self.assertEqual(self.normalizer.accept(report("FINISH")).reason,
+                         "unproven_terminal")
+
+        self.normalizer.disconnected()
+        self.normalizer.connected()
+        self.normalizer.accept(report("RUNNING", "long-task"))
+        for _ in range(MAX_STATE_LEASE_S // 60 + 1):
+            self.clock.tick(60)
+            self.normalizer.accept(b'{"print":{"mc_percent":42}}')
+        self.assertEqual(self.normalizer.accept(report("FINISH", "long-task")).reason,
+                         "unproven_terminal")
+
+    def test_conflicting_task_in_delta_erases_active_proof(self):
+        self.normalizer.accept(report("RUNNING", "first-task"))
+        self.assertEqual(self.normalizer.accept(
+            b'{"print":{"task_id":"other-task","mc_percent":42}}').reason,
+            "unknown")
+        self.assertEqual(self.normalizer.last_input_issue, "task_changed_without_state")
+        self.assertEqual(self.normalizer.accept(report("FINISH", "first-task")).reason,
                          "unproven_terminal")
 
 
@@ -469,6 +512,15 @@ class SessionSummaryTests(unittest.TestCase):
         stale, _ = self.run_session([report("RUNNING")], idle_after=21)
         self.assertEqual(stale["last_state_age_seconds"], 23)
         self.assertFalse(stale["last_state_fresh"])
+
+        deltas, events = self.run_session(
+            [report("RUNNING")] + [b'{"print":{"mc_percent":42}}'] * 43)
+        self.assertEqual(deltas["last_generic_state"], "printing")
+        self.assertEqual(deltas["last_state_age_seconds"], 88)
+        self.assertEqual(deltas["last_report_age_seconds"], 2)
+        self.assertFalse(deltas["last_state_fresh"])
+        self.assertEqual(deltas["issue_counts"], {"no_state": 43})
+        self.assertEqual(events, [])
 
         terminal, events = self.run_session([report("FINISH")])
         self.assertEqual(terminal["last_generic_state"], "finished")

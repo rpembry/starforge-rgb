@@ -20,6 +20,8 @@ from .contract import CueEvent
 from .printer_status import BambuCompletionAdapter, PrinterDecision, PrinterObservation
 
 MAX_REPORT = 16384
+MAX_PACKET_GAP_S = 60
+MAX_STATE_LEASE_S = 24 * 60 * 60
 _SERIAL = re.compile(r"[A-Za-z0-9]{12,32}\Z")
 _TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}\Z")
 _FINGERPRINT = re.compile(r"[0-9a-fA-F]{64}\Z")
@@ -145,7 +147,7 @@ def _unique_object(pairs):
 
 
 class P1ReportNormalizer:
-    """Require explicit state and task ID in each fresh report; gaps erase proof."""
+    """Merge harmless deltas within one bounded session; require explicit transitions."""
 
     def __init__(self, serial: str, *, clock: Callable[[], float] = time.time,
                  monotonic: Callable[[], float] = time.monotonic):
@@ -158,7 +160,7 @@ class P1ReportNormalizer:
         self.epoch = 0
         self.sequence = 0
         self.last_state_at: float | None = None
-        self.last_input_state: str | None = None
+        self.last_known_state: str | None = None
         self.last_input_at: float | None = None
         self.last_input_issue: str | None = None
         self.normalized_state_count = 0
@@ -172,7 +174,7 @@ class P1ReportNormalizer:
         self.epoch += 1
         self.sequence = 0
         self.last_state_at = None
-        self.last_input_state = None
+        self.last_known_state = None
         self.last_input_at = None
         self.last_input_issue = None
         self.normalized_state_count = 0
@@ -199,42 +201,55 @@ class P1ReportNormalizer:
         self.last_input_issue = None
         if not isinstance(raw, bytes) or len(raw) > MAX_REPORT:
             self.last_state_at = None
-            self.last_input_state, self.last_input_at = "unknown", now
+            self.last_known_state, self.last_input_at = "unknown", now
             self.last_input_issue = "invalid_report"
             self._observe("unknown", None)
             raise CollectorError("report exceeds size bound")
-        if self.last_state_at is not None and (now < self.last_state_at or
-                                               now - self.last_state_at > 20):
+        if ((self.last_input_at is not None and
+             (now < self.last_input_at or now - self.last_input_at > MAX_PACKET_GAP_S)) or
+            (self.last_state_at is not None and
+             (now < self.last_state_at or now - self.last_state_at > MAX_STATE_LEASE_S))):
             self._observe("unknown", None)
             self.last_state_at = None
+            self.last_known_state = "unknown"
         try:
             data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
         except (UnicodeError, ValueError) as exc:
             self.last_state_at = None
-            self.last_input_state, self.last_input_at = "unknown", now
+            self.last_known_state, self.last_input_at = "unknown", now
             self.last_input_issue = "invalid_report"
             self._observe("unknown", None)
             raise CollectorError("invalid report JSON") from exc
         if not isinstance(data, dict) or ("print" in data and
                                            not isinstance(data["print"], dict)):
             self.last_state_at = None
-            self.last_input_state, self.last_input_at = "unknown", now
+            self.last_known_state, self.last_input_at = "unknown", now
             self.last_input_issue = "invalid_print_shape"
             return self._observe("unknown", None)
         if "print" not in data:
-            self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_at = now
             self.last_input_issue = "no_print_report"
             return PrinterDecision("suppressed", "no_print_report")
         report = data["print"]
         raw_state = report.get("gcode_state")
         if raw_state is None:
-            self.last_input_state, self.last_input_at = "unknown", now
+            # Sparse push_status deltas do not assert a new printer state.
+            self.last_input_at = now
+            if "task_id" in report and self.adapter.active_job_id is not None:
+                task_delta = report["task_id"]
+                if (not isinstance(task_delta, str) or not _TASK.fullmatch(task_delta) or
+                        "j" + hashlib.sha256(task_delta.encode("ascii")).hexdigest()[:32]
+                        != self.adapter.active_job_id):
+                    self.last_state_at = None
+                    self.last_known_state = "unknown"
+                    self.last_input_issue = "task_changed_without_state"
+                    return self._observe("unknown", None)
             self.last_input_issue = "no_state"
             return PrinterDecision("suppressed", "no_state")
         if not isinstance(raw_state, str):
             self.last_state_at = None
-            self.last_input_state, self.last_input_at = "unknown", now
+            self.last_known_state, self.last_input_at = "unknown", now
             self.last_input_issue = "invalid_state_type"
             return self._observe("unknown", None)
         state = {"RUNNING": "printing", "PAUSE": "paused", "FINISH": "finished",
@@ -253,7 +268,7 @@ class P1ReportNormalizer:
                 task = "j" + hashlib.sha256(task.encode("ascii")).hexdigest()[:32]
         else:
             task = None
-        self.last_input_state, self.last_input_at = state, now
+        self.last_known_state, self.last_input_at = state, now
         if state != "unknown":
             self.normalized_state_count += 1
         self.last_state_at = now if state != "unknown" else None
@@ -476,6 +491,7 @@ _SUMMARY_REASONS = frozenset({
 _SUMMARY_ISSUES = frozenset({
     "invalid_report", "invalid_print_shape", "no_print_report", "no_state",
     "invalid_state_type", "unsupported_state", "missing_or_invalid_task",
+    "task_changed_without_state",
 })
 
 
@@ -534,9 +550,12 @@ def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
             "report_count": reports,
             "normalized_state_count": min(normalizer.normalized_state_count, 999999),
             "event_count": events,
-            "last_generic_state": normalizer.last_input_state,
-            "last_state_age_seconds": age,
-            "last_state_fresh": age_exact is not None and age_exact <= 20,
+            "last_generic_state": normalizer.last_known_state,
+            "last_state_age_seconds": (min(999999, int(max(0, ended - normalizer.last_state_at)))
+                                       if normalizer.last_state_at is not None else None),
+            "last_state_fresh": (normalizer.last_state_at is not None and
+                                 0 <= ended - normalizer.last_state_at <= 20),
+            "last_report_age_seconds": age,
             "reason_counts": dict(sorted(reasons.items())),
             "issue_counts": dict(sorted(issues.items())),
             "duration_seconds": max(0, min(999999, int(ended - started))),
