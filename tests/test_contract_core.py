@@ -91,6 +91,23 @@ class PolicyTests(unittest.TestCase):
         clock[0] = NOW + 250
         self.assertEqual(core.handle(event(event_id="next", idempotency_key="next"))["reason"], "stale")
 
+    def test_active_lease_severity_drop_restores_new_winner_immediately(self):
+        core, sinks = self.make_core()
+        low = event(event_id="low", idempotency_key="low", subject_id="low",
+                    severity="warning", cue_id="job.warning", text="Earlier warning")
+        high = event(event_id="high", idempotency_key="high", subject_id="high",
+                     severity="critical", cue_id="job.critical", text="Old critical")
+        core.handle(low)
+        core.handle(high)
+        changed = core.handle(event(event_id="high-update", idempotency_key="high-update",
+                                    subject_id="high", severity="info", status="progress",
+                                    cue_id="job.progress", text="Lowered"))
+        self.assertEqual(changed["channels"], {name: "preempted" for name in sinks})
+        self.assertEqual(changed["plan"]["subject_id"], "high")
+        self.assertEqual(core._active_key, ("synthetic.build", "subject:low"))
+        self.assertEqual(sinks["rgb"].state["rgb"]["cue_id"], "job.warning")
+        self.assertEqual(sinks["text"].state["text"]["text"], "Earlier warning")
+
     def test_rate_limit_and_unsupported(self):
         core = Coordinator({"rgb": FakeSink()}, clock=lambda: NOW)
         for i in range(10):

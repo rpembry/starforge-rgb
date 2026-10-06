@@ -537,6 +537,11 @@ class Coordinator:
         self._leases[lease_key] = _Lease(deadline, first_seen, renewals, {"info": 1, "warning": 2,
                                                  "critical": 3}[event.severity], self._sequence, plan)
         if self._top() != lease_key:
+            if self._active_key == lease_key:
+                # A renewal can lower the active lease below another one.
+                # Restore the new winner now, while reporting only this
+                # producer's preempted event to its caller.
+                self._reconcile()
             return {"result": "accepted", "reason": None, "plan": plan,
                     "channels": {channel: "preempted" for channel in CHANNELS}}
         self._active_key = lease_key
