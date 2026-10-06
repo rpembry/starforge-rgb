@@ -7,7 +7,7 @@ import sys
 
 from .contract import ContractError, MAX_BYTES
 from .core import Coordinator
-from .ingress_contract import IngressBinding, PublishFrame, authorize_frame, parse_frame_json
+from .ingress_contract import HelloFrame, IngressBinding, PublishFrame, authorize_frame, parse_frame_json
 from .transport import LocalServer, to_receipt
 
 
@@ -21,8 +21,11 @@ class _BoundHandler(LocalServer.handler_class):
                 raw = self.rfile.readline(MAX_BYTES + 2)
                 if not raw.endswith(b"\n") or len(raw) > MAX_BYTES + 1:
                     raise ContractError("frame: too large or unterminated")
-                frame = parse_frame_json(raw[:-1])
-                if not isinstance(frame, PublishFrame):
+                frame = parse_frame_json(raw[:-1], expected_session=self.server.session_epoch)
+                if isinstance(frame, HelloFrame) and self.server.session_epoch is not None:
+                    response = {"version": 1, "result": "ready",
+                                "session_epoch": self.server.session_epoch}
+                elif not isinstance(frame, PublishFrame):
                     response = _rejected("unsupported_operation")
                 else:
                     try:
@@ -52,16 +55,20 @@ class BoundLocalServer(LocalServer):
     handler_class = _BoundHandler
 
     def __init__(self, path, coordinator: Coordinator, binding: IngressBinding,
-                 *, expected_uid: int):
+                 *, expected_uid: int, session_epoch: str | None = None):
         if (sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED") or
                 not isinstance(binding, IngressBinding) or
                 not isinstance(coordinator, Coordinator) or
                 type(expected_uid) is not int or expected_uid < 0 or
+                (session_epoch is not None and
+                 (not isinstance(session_epoch, str) or len(session_epoch) != 32 or
+                  any(char not in "0123456789abcdef" for char in session_epoch))) or
                 len(binding.source_ids) != 1 or binding.can_retract or
                 "cancelled" in binding.statuses):
             raise ValueError("bound publish listener requires Linux, one source and no retraction")
         self.binding = binding
         self.expected_uid = expected_uid
+        self.session_epoch = session_epoch
         super().__init__(path, coordinator)
 
     @staticmethod
