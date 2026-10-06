@@ -1,6 +1,6 @@
 # P1S foreground collector candidate
 
-This is a software-only, user-run candidate. The collector has no printer command or MQTT `PUBLISH` method. It opens a TLS connection to a private IPv4 address, authenticates only after CA validation and an exact peer-certificate SHA-256 match, subscribes to `device/<serial>/report`, and accepts bounded JSON reports. The only live command prints the generic semantic cue ID to the terminal; it does not dispatch a desktop, sound, or RGB notification, install a service, or start automatically. Neither the developer tests nor this document connect to a printer.
+This is a software-only, user-run candidate. The collector has no printer command or MQTT `PUBLISH` method. It opens a TLS connection to a private IPv4 address, authenticates only after CA validation and an exact peer-certificate SHA-256 match, subscribes to `device/<serial>/report`, and accepts bounded JSON reports. The only live command prints a generic semantic cue ID when proven and a bounded session summary to the terminal; it does not dispatch a desktop, sound, or RGB notification, install a service, or start automatically. Neither the developer tests nor this document connect to a printer.
 
 ## Evidence and limits
 
@@ -35,6 +35,10 @@ A user-run certificate-only probe confirmed the public CA file checksum and retu
 The probe reports a bounded numeric Python/OpenSSL verification code without displaying exception text, certificate fields, paths, or credentials. Code 92 is defined in the [OpenSSL verification constants](https://github.com/openssl/openssl/blob/openssl-3.5.4/include/openssl/x509_vfy.h.in) and its description is given by the installed OpenSSL library. The compatibility option has only fake-test coverage until a separately authorized, user-run certificate-only retry; no credential-bearing retry has occurred.
 
 Any actual text/audio/RGB notification needs a separately reviewed mapping from the semantic callback into the existing local coordinator and a deliberate live commissioning test. Nothing in this collector proves the current printer state or notification delivery.
+
+### Interpreting the session summary
+
+One user-run 120-second observation ended without an error or cue. That result alone does not show whether reports arrived, whether they had usable states, or whether a print completed. The next build prints one `printer session: {...}` summary at exit, including TLS/leaf-pin/MQTT acceptance stages, report and normalized-state counts, the last generic state and its age, bounded reason counts, duration, and exit category. It never includes the serial, access code, task ID, job name, or raw report. `subscription_accepted: true` with `report_count: 0` means subscription succeeded but no reports were observed; reports with zero normalized states and `no_state` or `unknown` reasons suggest partial or unsupported content. `last_generic_state: printing` without an event means a run was observed but no proven finish was seen. A lone `finished` with `unproven_terminal` remains a snapshot, not a completion notification. These observations remain software-only evidence and do not establish visible or audible notification delivery.
 
 Fake-only verification:
 

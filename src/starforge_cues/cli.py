@@ -66,7 +66,10 @@ def main(argv: list[str] | None = None) -> int:
                         bambu_legacy_ca=args.bambu_legacy_ca)
                     normalizer = P1ReportNormalizer(args.serial)
                     collect_once(client, normalizer,
-                                 lambda event: print(f"semantic cue: {event.cue_id}", flush=True))
+                                 lambda event: print(f"semantic cue: {event.cue_id}", flush=True),
+                                 on_summary=lambda summary: print(
+                                     "printer session: " + json.dumps(summary, sort_keys=True),
+                                     flush=True))
                 return 0
             except KeyboardInterrupt:
                 return 0

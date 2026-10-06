@@ -388,5 +388,123 @@ class ProbeDiagnosticTests(unittest.TestCase):
                          "printer probe failed: tls_ca_validation_failed_x509_79")
 
 
+class SessionSummaryTests(unittest.TestCase):
+    def run_session(self, messages, *, interrupt=False, idle_after=0):
+        clock = Clock()
+        normalizer = P1ReportNormalizer("01P0000000000000", clock=lambda: clock.value,
+                                        monotonic=lambda: clock.value)
+        summaries = []
+        events = []
+
+        class FakeClient:
+            tls_verified = True
+            peer_pin_verified = True
+            auth_accepted = True
+            subscription_accepted = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def reports(self):
+                for message in messages:
+                    yield message
+                    clock.tick(2)
+                clock.tick(idle_after)
+                if interrupt:
+                    clock.tick(1)
+                    raise KeyboardInterrupt()
+
+        if interrupt:
+            with self.assertRaises(KeyboardInterrupt):
+                collect_once(FakeClient(), normalizer, events.append,
+                             on_summary=summaries.append, monotonic=lambda: clock.value)
+        else:
+            collect_once(FakeClient(), normalizer, events.append,
+                         on_summary=summaries.append, monotonic=lambda: clock.value)
+        self.assertEqual(len(summaries), 1)
+        return summaries[0], events
+
+    def test_no_messages_reports_authenticated_but_unobserved(self):
+        summary, events = self.run_session([], interrupt=True)
+        self.assertEqual(summary["exit"], "interrupted")
+        self.assertTrue(summary["tls_verified"])
+        self.assertTrue(summary["peer_pin_verified"])
+        self.assertTrue(summary["auth_accepted"])
+        self.assertTrue(summary["subscription_accepted"])
+        self.assertEqual(summary["report_count"], 0)
+        self.assertEqual(summary["normalized_state_count"], 0)
+        self.assertIsNone(summary["last_generic_state"])
+        self.assertIsNone(summary["last_state_age_seconds"])
+        self.assertEqual(events, [])
+
+    def test_partial_and_unsupported_reports_have_bounded_reasons(self):
+        summary, events = self.run_session([
+            b'{"other":"private-text"}', b'{"print":{"mc_percent":42}}',
+            report("FAILED"), b'{"print":',
+        ])
+        self.assertEqual(summary["report_count"], 4)
+        self.assertEqual(summary["normalized_state_count"], 0)
+        self.assertEqual(summary["last_generic_state"], "unknown")
+        self.assertEqual(summary["reason_counts"], {
+            "invalid_report": 1, "no_print_report": 1, "no_state": 1, "unknown": 1,
+        })
+        self.assertNotIn("private-text", repr(summary))
+        self.assertEqual(events, [])
+
+    def test_running_without_finish_and_terminal_snapshot_are_distinct(self):
+        running, events = self.run_session([report("RUNNING")])
+        self.assertEqual(running["normalized_state_count"], 1)
+        self.assertEqual(running["last_generic_state"], "printing")
+        self.assertTrue(running["last_state_fresh"])
+        self.assertEqual(running["reason_counts"], {"active": 1})
+        self.assertEqual(events, [])
+
+        stale, _ = self.run_session([report("RUNNING")], idle_after=21)
+        self.assertEqual(stale["last_state_age_seconds"], 23)
+        self.assertFalse(stale["last_state_fresh"])
+
+        terminal, events = self.run_session([report("FINISH")])
+        self.assertEqual(terminal["last_generic_state"], "finished")
+        self.assertEqual(terminal["reason_counts"], {"unproven_terminal": 1})
+        self.assertEqual(terminal["event_count"], 0)
+        self.assertEqual(events, [])
+
+        proven, events = self.run_session([report("RUNNING"), report("FINISH")])
+        self.assertEqual(proven["normalized_state_count"], 2)
+        self.assertEqual(proven["event_count"], 1)
+        self.assertEqual([event.cue_id for event in events], ["printer.completed"])
+        self.assertNotIn("synthetic-task", repr(proven))
+
+    def test_failed_mqtt_auth_reports_stage_without_claiming_subscription(self):
+        clock = Clock()
+        normalizer = P1ReportNormalizer("01P0000000000000", clock=lambda: clock.value,
+                                        monotonic=lambda: clock.value)
+        summaries = []
+
+        class RejectingClient:
+            tls_verified = True
+            peer_pin_verified = True
+            auth_accepted = False
+            subscription_accepted = False
+
+            def __enter__(self):
+                raise CollectorError("MQTT connection rejected")
+
+            def __exit__(self, *_):
+                pass
+
+        with self.assertRaises(CollectorError):
+            collect_once(RejectingClient(), normalizer, lambda _: None,
+                         on_summary=summaries.append, monotonic=lambda: clock.value)
+        self.assertEqual(summaries[0]["exit"], "mqtt_connection_rejected")
+        self.assertTrue(summaries[0]["tls_verified"])
+        self.assertFalse(summaries[0]["auth_accepted"])
+        self.assertFalse(summaries[0]["subscription_accepted"])
+        self.assertEqual(summaries[0]["report_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

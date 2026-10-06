@@ -158,6 +158,9 @@ class P1ReportNormalizer:
         self.epoch = 0
         self.sequence = 0
         self.last_state_at: float | None = None
+        self.last_input_state: str | None = None
+        self.last_input_at: float | None = None
+        self.normalized_state_count = 0
         self.is_connected = False
 
     def connected(self) -> None:
@@ -168,6 +171,9 @@ class P1ReportNormalizer:
         self.epoch += 1
         self.sequence = 0
         self.last_state_at = None
+        self.last_input_state = None
+        self.last_input_at = None
+        self.normalized_state_count = 0
         self.is_connected = True
 
     def disconnected(self) -> None:
@@ -187,11 +193,12 @@ class P1ReportNormalizer:
     def accept(self, raw: bytes) -> PrinterDecision:
         if not self.is_connected:
             raise CollectorError("collector is disconnected")
+        now = self.monotonic()
         if not isinstance(raw, bytes) or len(raw) > MAX_REPORT:
             self.last_state_at = None
+            self.last_input_state, self.last_input_at = "unknown", now
             self._observe("unknown", None)
             raise CollectorError("report exceeds size bound")
-        now = self.monotonic()
         if self.last_state_at is not None and (now < self.last_state_at or
                                                now - self.last_state_at > 20):
             self._observe("unknown", None)
@@ -201,20 +208,25 @@ class P1ReportNormalizer:
                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
         except (UnicodeError, ValueError) as exc:
             self.last_state_at = None
+            self.last_input_state, self.last_input_at = "unknown", now
             self._observe("unknown", None)
             raise CollectorError("invalid report JSON") from exc
         if not isinstance(data, dict) or ("print" in data and
                                            not isinstance(data["print"], dict)):
             self.last_state_at = None
+            self.last_input_state, self.last_input_at = "unknown", now
             return self._observe("unknown", None)
         if "print" not in data:
+            self.last_input_state, self.last_input_at = "unknown", now
             return PrinterDecision("suppressed", "no_print_report")
         report = data["print"]
         raw_state = report.get("gcode_state")
         if raw_state is None:
+            self.last_input_state, self.last_input_at = "unknown", now
             return PrinterDecision("suppressed", "no_state")
         if not isinstance(raw_state, str):
             self.last_state_at = None
+            self.last_input_state, self.last_input_at = "unknown", now
             return self._observe("unknown", None)
         state = {"RUNNING": "printing", "PAUSE": "paused", "FINISH": "finished",
                  "IDLE": "idle"}.get(raw_state, "unknown")
@@ -229,6 +241,9 @@ class P1ReportNormalizer:
                 task = "j" + hashlib.sha256(task.encode("ascii")).hexdigest()[:32]
         else:
             task = None
+        self.last_input_state, self.last_input_at = state, now
+        if state != "unknown":
+            self.normalized_state_count += 1
         self.last_state_at = now if state != "unknown" else None
         return self._observe(state, task)
 
@@ -359,17 +374,27 @@ class SubscribeOnlyP1Client:
         self.credential_loader = credential_loader
         self.bambu_legacy_ca = bambu_legacy_ca
         self.stream = None
+        self.tls_verified = False
+        self.peer_pin_verified = False
+        self.auth_accepted = False
+        self.subscription_accepted = False
         self.topic = f"device/{self.serial}/report".encode("ascii")
 
     def __enter__(self):
+        self.tls_verified = False
+        self.peer_pin_verified = False
+        self.auth_accepted = False
+        self.subscription_accepted = False
         stream = self.tls_opener(
             self.host, self.ca_file,
             **({"bambu_legacy_ca": True} if self.bambu_legacy_ca is True else {}))
+        self.tls_verified = True
         try:
             certificate = stream.getpeercert(binary_form=True)
             if not certificate or not secrets.compare_digest(
                     hashlib.sha256(certificate).digest(), self.peer_pin):
                 raise CollectorError("printer certificate pin mismatch")
+            self.peer_pin_verified = True
             code = self.credential_loader(self.credential_file)
             client_id = b"starforge-" + secrets.token_hex(8).encode("ascii")
             variable = _encoded_string(b"MQTT") + bytes((4, 0xC2)) + struct.pack("!H", 30)
@@ -379,10 +404,12 @@ class SubscribeOnlyP1Client:
             header, body = _read_packet(stream)
             if header != 0x20 or body != b"\x00\x00":
                 raise CollectorError("MQTT connection rejected")
+            self.auth_accepted = True
             stream.sendall(_packet(0x82, b"\x00\x01" + _encoded_string(self.topic) + b"\x00"))
             header, body = _read_packet(stream)
             if header != 0x90 or body != b"\x00\x01\x00":
                 raise CollectorError("MQTT subscription rejected")
+            self.subscription_accepted = True
             self.stream = stream
             return self
         except Exception:
@@ -429,18 +456,66 @@ class SubscribeOnlyP1Client:
             yield payload
 
 
+_SUMMARY_REASONS = frozenset({
+    "active", "paused", "idle", "unknown", "no_print_report", "no_state",
+    "invalid_report", "unproven_terminal", "duplicate_terminal",
+    "stale_or_future", "out_of_order",
+})
+
+
 def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
-                 on_event: Callable[[CueEvent], None]) -> None:
-    """One foreground session; callback is the future semantic output seam."""
+                 on_event: Callable[[CueEvent], None], *,
+                 on_summary: Callable[[dict], None] | None = None,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+    """One foreground session with bounded, content-free commissioning evidence."""
+    started = monotonic()
+    reports = 0
+    events = 0
+    reasons: dict[str, int] = {}
+    exit_reason = "stream_ended"
     try:
         with client:
             normalizer.connected()
             for raw in client.reports():
+                reports = min(reports + 1, 999999)
                 try:
                     decision = normalizer.accept(raw)
                 except CollectorError:
+                    reasons["invalid_report"] = min(reasons.get("invalid_report", 0) + 1,
+                                                    999999)
                     continue
+                if decision.reason in _SUMMARY_REASONS:
+                    reasons[decision.reason] = min(reasons.get(decision.reason, 0) + 1,
+                                                   999999)
                 if decision.event is not None:
+                    events = min(events + 1, 999999)
                     on_event(decision.event)
+    except KeyboardInterrupt:
+        exit_reason = "interrupted"
+        raise
+    except Exception as exc:
+        exit_reason = diagnostic_code(exc)
+        raise
     finally:
+        ended = monotonic()
+        age_exact = (max(0, ended - normalizer.last_input_at)
+               if normalizer.last_input_at is not None else None)
+        age = min(999999, int(age_exact)) if age_exact is not None else None
+        summary = {
+            "tls_verified": getattr(client, "tls_verified", False) is True,
+            "peer_pin_verified": getattr(client, "peer_pin_verified", False) is True,
+            "auth_accepted": getattr(client, "auth_accepted", False) is True,
+            "subscription_accepted": getattr(client, "subscription_accepted", False) is True,
+            "report_count": reports,
+            "normalized_state_count": min(normalizer.normalized_state_count, 999999),
+            "event_count": events,
+            "last_generic_state": normalizer.last_input_state,
+            "last_state_age_seconds": age,
+            "last_state_fresh": age_exact is not None and age_exact <= 20,
+            "reason_counts": dict(sorted(reasons.items())),
+            "duration_seconds": max(0, min(999999, int(ended - started))),
+            "exit": exit_reason,
+        }
         normalizer.disconnected()
+        if on_summary is not None:
+            on_summary(summary)
