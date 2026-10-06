@@ -8,7 +8,7 @@ from starforge_cues.contract import ContractError
 from starforge_cues.ingress_contract import (
     AdmittedTransition, BoundFrame, GenerationIds, GenerationRef, HelloFrame,
     IngressBinding, OwnedGeneration, PublishFrame, RetractFrame, RetractionReplay,
-    authorize_frame, parse_frame,
+    admit_retraction, authorize_frame, parse_frame,
 )
 
 
@@ -55,7 +55,8 @@ class IngressContractTests(unittest.TestCase):
         self.assertEqual(authorize_frame(binding(), publish).binding_id, "synthetic.binding")
         owned = {("synthetic.build", "example-job"):
                  OwnedGeneration("synthetic.binding", GenerationRef(EPOCH, 1))}
-        self.assertEqual(authorize_frame(binding(), retract, owned).frame, retract)
+        self.assertEqual(authorize_frame(binding(), retract).frame, retract)
+        self.assertEqual(admit_retraction(binding(), retract, owned, RetractionReplay(), 0), "new")
         self.assertEqual(authorize_frame(binding(), hello).frame, hello)
         for frame in ({"proto": True, "op": "hello"}, {"proto": 2, "op": "hello"},
                       {"proto": 1, "op": "hello", "token": "no"},
@@ -103,12 +104,40 @@ class IngressContractTests(unittest.TestCase):
         current = RetractFrame(*key, "new-request", second)
         ownership = {key: OwnedGeneration("synthetic.binding", second)}
         with self.assertRaises(ContractError):
-            authorize_frame(binding(), old, ownership)
-        self.assertEqual(authorize_frame(binding(), current, ownership).frame, current)
+            admit_retraction(binding(), old, ownership, RetractionReplay(), 0)
+        self.assertEqual(admit_retraction(binding(), current, ownership,
+                                          RetractionReplay(), 0), "new")
         with self.assertRaises(ContractError):
-            authorize_frame(binding(binding_id="other.binding"), current, ownership)
+            admit_retraction(binding(binding_id="other.binding"), current, ownership,
+                             RetractionReplay(), 0)
         with self.assertRaises(ContractError):
-            authorize_frame(binding(), current)
+            admit_retraction(binding(), current, {}, RetractionReplay(), 0)
+
+    def test_successful_retract_lost_ack_then_exact_retry_is_idempotent(self):
+        key = ("synthetic.build", "reused-name")
+        first = GenerationRef(EPOCH, 1)
+        request = RetractFrame(*key, "request-one", first)
+        ownership = {key: OwnedGeneration("synthetic.binding", first)}
+        replay = RetractionReplay()
+        self.assertEqual(admit_retraction(binding(), request, ownership, replay, 0), "new")
+        del ownership[key]  # successful retraction removed the original lease
+        self.assertEqual(admit_retraction(binding(), request, ownership, replay, 1), "duplicate")
+        ownership[key] = OwnedGeneration("synthetic.binding", GenerationRef(EPOCH, 2))
+        self.assertEqual(admit_retraction(binding(), request, ownership, replay, 2), "duplicate")
+        changed = RetractFrame(*key, "request-one", GenerationRef(EPOCH, 2))
+        with self.assertRaisesRegex(ContractError, "replay_conflict"):
+            admit_retraction(binding(), changed, ownership, replay, 2)
+        self.assertEqual(ownership[key].generation, GenerationRef(EPOCH, 2))
+
+    def test_failed_retract_reservation_can_roll_back_before_unlock(self):
+        key = ("synthetic.build", "run")
+        gen = GenerationRef(EPOCH, 1)
+        request = RetractFrame(*key, "retry-after-failure", gen)
+        ownership = {key: OwnedGeneration("synthetic.binding", gen)}
+        replay = RetractionReplay()
+        self.assertEqual(admit_retraction(binding(), request, ownership, replay, 0), "new")
+        replay.forget_failed_reservation(BoundFrame("synthetic.binding", request))
+        self.assertEqual(admit_retraction(binding(), request, ownership, replay, 1), "new")
 
     def test_retract_request_ids_are_bounded_and_binding_scoped(self):
         replay = RetractionReplay()

@@ -185,10 +185,8 @@ class OwnedGeneration:
             raise ValueError("invalid owned generation")
 
 
-def authorize_frame(binding: IngressBinding, frame: Frame,
-                    owned_generations: Mapping[tuple[str, str], OwnedGeneration] | None = None
-                    ) -> BoundFrame:
-    """Check only static scope; an ingress adapter must establish the binding."""
+def authorize_frame(binding: IngressBinding, frame: Frame) -> BoundFrame:
+    """Check static scope only; current generation is checked after replay lookup."""
     if not isinstance(binding, IngressBinding):
         raise TypeError("host binding required")
     if isinstance(frame, PublishFrame):
@@ -208,11 +206,6 @@ def authorize_frame(binding: IngressBinding, frame: Frame,
     elif isinstance(frame, RetractFrame):
         if not binding.can_retract or frame.source_id not in binding.source_ids:
             raise ContractError("binding: retract outside scope")
-        owner = (owned_generations or {}).get((frame.source_id, frame.subject_id))
-        if (not isinstance(owner, OwnedGeneration) or
-                owner.binding_id != binding.binding_id or
-                owner.generation != frame.expected_generation):
-            raise ContractError("binding: retract generation mismatch")
     elif not isinstance(frame, HelloFrame):
         raise ContractError("binding: unsupported frame")
     return BoundFrame(binding.binding_id, frame)
@@ -257,3 +250,44 @@ class RetractionReplay:
                 now + RETRACT_REPLAY_SECONDS, bound.frame)
             self._binding_counts[bound.binding_id] = self._binding_counts.get(bound.binding_id, 0) + 1
         return outcome
+
+    def forget_failed_reservation(self, bound: BoundFrame) -> None:
+        """Roll back a new request if its in-lock retraction did not execute."""
+        key = (bound.binding_id, bound.frame.request_id)
+        previous = self._seen.get(key)
+        if previous is None or previous[1] != bound.frame:
+            return
+        del self._seen[key]
+        remaining = self._binding_counts[bound.binding_id] - 1
+        if remaining:
+            self._binding_counts[bound.binding_id] = remaining
+        else:
+            del self._binding_counts[bound.binding_id]
+
+
+def admit_retraction(binding: IngressBinding, frame: RetractFrame,
+                     owned_generations: Mapping[tuple[str, str], OwnedGeneration],
+                     replay: RetractionReplay, now: float) -> str:
+    """Classify and reserve one retract under the host lock; do not execute it.
+
+    A recorded exact retry is acknowledged before current ownership is checked,
+    since a successful first retract already removed that ownership. New requests
+    must still prove ownership of the exact expected generation.
+    """
+    bound = authorize_frame(binding, frame)
+    if (not isinstance(frame, RetractFrame) or not isinstance(replay, RetractionReplay) or
+            not isinstance(owned_generations, Mapping)):
+        raise TypeError("retract frame, ownership and replay window required")
+    prior = replay.classify(bound, now)
+    if prior == "duplicate":
+        return "duplicate"
+    if prior == "conflict":
+        raise ContractError("retract: replay_conflict")
+    if prior == "capacity":
+        raise ContractError("retract: capacity")
+    owner = owned_generations.get((frame.source_id, frame.subject_id))
+    if (not isinstance(owner, OwnedGeneration) or
+            owner.binding_id != binding.binding_id or
+            owner.generation != frame.expected_generation):
+        raise ContractError("retract: generation mismatch")
+    return replay.remember(bound, now)
