@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from .channel_select import rgb_winner
+
 
 MAX_SUBJECT_GENERATIONS = 2048
 
@@ -66,7 +68,4 @@ class LeaseBook:
         return len(self.retired) + active_subjects < MAX_SUBJECT_GENERATIONS
 
     def top(self) -> tuple[str, str] | None:
-        if not self.leases:
-            return None
-        return max(self.leases, key=lambda key: (self.leases[key].priority,
-                                                 self.leases[key].sequence))
+        return rgb_winner(self.leases)
