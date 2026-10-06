@@ -134,7 +134,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(core.handle(event(clock[0], event_id="new", idempotency_key="new",
                                            subject_id="run-two", status="started"))["result"], "accepted")
 
-    def test_retired_and_active_capacity_keeps_cancellation_available(self):
+    def test_retired_capacity_does_not_block_unrelated_cues(self):
         clock = [NOW]
         core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
         core.handle(event(clock[0], event_id="active", idempotency_key="active",
@@ -144,9 +144,43 @@ class LifecycleTests(unittest.TestCase):
         cancel = core.handle(event(clock[0], event_id="stop", idempotency_key="stop",
                                    subject_id="run-one", status="cancelled"))
         self.assertEqual(cancel["result"], "accepted")
-        self.assertLessEqual(len(core._retired_subjects) + len(core._leases), 4096)
+        self.assertEqual(len(core._retired_subjects), 2048)
         self.assertEqual(core.handle(event(clock[0], event_id="next", idempotency_key="next",
-                                           subject_id="run-two"))["reason"], "capacity")
+                                           subject_id="run-two"))["result"], "accepted")
+        self.assertNotIn(("other.source", "subject:retired-0"), core._retired_subjects)
+
+    def test_unknown_cancellation_flood_preserves_replay_record(self):
+        clock = [NOW]
+        audio = FakeSink()
+        core = Coordinator({"audio": audio}, clock=lambda: clock[0])
+        original = event(clock[0], event_id="original", idempotency_key="original",
+                         subject_id="real", ttl_ms=300000)
+        self.assertEqual(core.handle(original)["result"], "accepted")
+        sound_count = len(audio.calls)
+        for index in range(4096):
+            missing = event(clock[0], event_id=f"cancel-{index}",
+                            idempotency_key=f"cancel-{index}", source_id="other.source",
+                            subject_id=f"missing-{index}", status="cancelled", ttl_ms=300000)
+            self.assertEqual(core.handle(missing)["reason"], "unknown_subject")
+        self.assertEqual(len(core._seen), 1)
+        self.assertEqual(core.handle(original)["reason"], "duplicate")
+        self.assertEqual(len(audio.calls), sound_count)
+
+    def test_many_short_lived_subjects_do_not_starve_new_traffic(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        for index in range(2200):
+            identifier = f"short-{index}"
+            self.assertEqual(core.handle(event(clock[0], event_id=identifier,
+                                               idempotency_key=identifier,
+                                               source_id=f"source-{index % 256}",
+                                               subject_id=identifier, ttl_ms=1))["result"], "accepted")
+            clock[0] += 0.002
+        core.tick()
+        self.assertEqual(len(core._retired_subjects), 2048)
+        self.assertEqual(core.handle(event(clock[0], event_id="fresh", idempotency_key="fresh",
+                                           source_id="source-0", subject_id=None,
+                                           ttl_ms=1))["result"], "accepted")
 
     def test_expired_one_shots_do_not_starve_unrelated_traffic(self):
         clock = [NOW]

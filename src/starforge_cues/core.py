@@ -9,6 +9,7 @@ from typing import Callable, Protocol
 from .contract import CueEvent
 
 CHANNELS = ("text", "rgb", "audio")
+MAX_RETIRED_SUBJECTS = 2048
 
 
 def _valid_baseline_text(text: str | None) -> bool:
@@ -304,6 +305,8 @@ class Coordinator:
         # a distinct subject explicitly starts a new run.
         until = lease.first_seen + 2 * self.max_lease_age_s
         if until > now:
+            while key not in self._retired_subjects and len(self._retired_subjects) >= MAX_RETIRED_SUBJECTS:
+                self._retired_subjects.pop(next(iter(self._retired_subjects)))
             self._retired_subjects[key] = until
 
     def _top(self) -> tuple[str, str] | None:
@@ -438,10 +441,9 @@ class Coordinator:
     def _remember(self, key: tuple[str, str], event_key: tuple[str, str],
                   expiry: float, event: CueEvent) -> None:
         if len(self._seen) >= 4096:
-            # Reserve admission for cancellation by evicting the oldest replay record.
-            old_key = next(iter(self._seen))
-            old_event = self._seen.pop(old_key)[1]
-            self._seen_events.pop((old_event.source_id, old_event.event_id), None)
+            # A state-clearing cancellation may bypass admission, but cannot
+            # discard another event's live replay protection to do so.
+            return
         self._seen[key] = (expiry, event)
         self._seen_events[event_key] = key
 
@@ -482,13 +484,15 @@ class Coordinator:
         lease_key = (event.source_id, f"subject:{event.subject_id}" if event.subject_id is not None
                      else f"event:{event.event_id}")
         cancellation = event.status == "cancelled"
+        if cancellation and lease_key not in self._leases:
+            return {"result": "suppressed", "reason": "unknown_subject", "channels": {}}
         if not cancellation:
             if lease_key in self._retired_subjects:
                 return {"result": "suppressed", "reason": "lease_limit", "channels": {}}
             if len(self._rate) >= 256 and event.source_id not in self._rate:
                 return {"result": "suppressed", "reason": "source_limit", "channels": {}}
             if (len(self._seen) >= 4096 or
-                    (len(self._leases) + len(self._retired_subjects) >= 4096 and lease_key not in self._leases)):
+                    (len(self._leases) >= 4096 and lease_key not in self._leases)):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
             recent = self._rate.get(event.source_id, [])
             if self.cooldown_seconds and recent and monotonic_now - recent[-1] < self.cooldown_seconds:
