@@ -61,8 +61,8 @@ class PolicyFoundationTests(unittest.TestCase):
         core = Coordinator(clock=lambda: NOW, cooldown_seconds=10,
                            own_origins=frozenset({"starforge-host"}))
         self.assertEqual(core.handle(event(origin_id="starforge-host"))["reason"], "self_origin")
-        self.assertEqual(core.handle(event())["result"], "accepted")
-        second = event(event_id="second", idempotency_key="second")
+        self.assertEqual(core.handle(event(status="started"))["result"], "accepted")
+        second = event(event_id="second", idempotency_key="second", status="progress")
         self.assertEqual(core.handle(second)["reason"], "cooldown")
 
     def test_unmute_after_expiry_never_restores_stale_cue(self):

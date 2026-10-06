@@ -68,7 +68,8 @@ class LifecycleTests(unittest.TestCase):
         rgb = FakeSink()
         core = Coordinator({"rgb": rgb}, clock=lambda: clock[0], max_lease_age_s=300)
         core.set_baseline(1, "ambient")
-        core.handle(event(clock[0], event_id="first", idempotency_key="first", subject_id="run-one"))
+        core.handle(event(clock[0], event_id="first", idempotency_key="first",
+                          subject_id="run-one", status="started"))
         clock[0] += 200
         renewed = core.handle(event(clock[0], event_id="renew", idempotency_key="renew",
                                     subject_id="run-one", status="progress"))
@@ -133,6 +134,103 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(resume["reason"], "lease_limit")
         self.assertEqual(core.handle(event(clock[0], event_id="new", idempotency_key="new",
                                            subject_id="run-two", status="started"))["result"], "accepted")
+
+    def test_active_terminal_uses_separate_bounded_admission(self):
+        clock = [NOW]
+        audio = FakeSink()
+        core = Coordinator({"audio": audio}, clock=lambda: clock[0], cooldown_seconds=60)
+        for index in range(10):
+            identifier = f"progress-{index}"
+            result = core.handle(event(clock[0], event_id=identifier, idempotency_key=identifier,
+                                       subject_id="run-one", status="started" if index == 0 else "progress"))
+            # The cooldown blocks repeated progress, so use a second instance
+            # below to exercise a full ten-event rate window.
+            if index:
+                self.assertEqual(result["reason"], "cooldown")
+            else:
+                self.assertEqual(result["result"], "accepted")
+        terminal = event(clock[0], event_id="failed", idempotency_key="failed",
+                         subject_id="run-one", status="failed", severity="critical")
+        self.assertEqual(core.handle(terminal)["result"], "accepted")
+        self.assertEqual(core.handle(terminal)["reason"], "duplicate")
+        self.assertEqual(core.handle(event(clock[0], event_id="second-terminal",
+                                           idempotency_key="second-terminal", subject_id="run-one",
+                                           status="succeeded"))["reason"], "duplicate")
+        self.assertEqual(core.handle(event(clock[0], event_id="resume",
+                                           idempotency_key="resume", subject_id="run-one",
+                                           status="progress"))["reason"], "lease_limit")
+        self.assertEqual(len(core._terminal_rate["synthetic.build"]), 1)
+
+        full = Coordinator(clock=lambda: clock[0])
+        for index in range(10):
+            identifier = f"update-{index}"
+            self.assertEqual(full.handle(event(clock[0], event_id=identifier,
+                                               idempotency_key=identifier, subject_id="other-run",
+                                               status="progress"))["result"], "accepted")
+        self.assertEqual(full.handle(event(clock[0], event_id="normal",
+                                           idempotency_key="normal", subject_id="other-run",
+                                           status="progress"))["reason"], "rate_limit")
+        self.assertEqual(full.handle(event(clock[0], event_id="terminal",
+                                           idempotency_key="terminal", subject_id="other-run",
+                                           status="failed"))["result"], "accepted")
+        self.assertEqual(len(full._rate["synthetic.build"]), 10)
+
+    def test_terminal_does_not_revive_expired_or_horizon_limited_subject(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0], max_lease_age_s=300)
+        core.handle(event(clock[0], event_id="short", idempotency_key="short",
+                          subject_id="short", status="started", ttl_ms=1))
+        clock[0] += 0.002
+        expired = core.handle(event(clock[0], event_id="short-failed",
+                                    idempotency_key="short-failed", subject_id="short",
+                                    status="failed"))
+        self.assertEqual(expired["reason"], "lease_limit")
+        self.assertEqual(len(core._terminal_rate), 0)
+        self.assertEqual(len(core._rate["synthetic.build"]), 1)
+        core.handle(event(clock[0], event_id="long", idempotency_key="long",
+                          subject_id="long", status="started"))
+        clock[0] += 301
+        limited = core.handle(event(clock[0], event_id="long-failed",
+                                    idempotency_key="long-failed", subject_id="long",
+                                    status="failed"))
+        self.assertEqual(limited["reason"], "lease_limit")
+        self.assertEqual(len(core._terminal_rate), 0)
+
+    def test_terminal_reserve_has_per_source_rate_bound(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0])
+        for index in range(21):
+            if index in (10, 20):
+                clock[0] += 61
+            identifier = f"run-{index}"
+            self.assertEqual(core.handle(event(clock[0], event_id=identifier,
+                                               idempotency_key=identifier,
+                                               subject_id=identifier, status="started"))["result"],
+                             "accepted")
+        for index in range(21):
+            identifier = f"finish-{index}"
+            result = core.handle(event(clock[0], event_id=identifier,
+                                       idempotency_key=identifier,
+                                       subject_id=f"run-{index}", status="succeeded"))
+            self.assertEqual(result["result"] if index < 20 else result["reason"],
+                             "accepted" if index < 20 else "rate_limit")
+        self.assertEqual(len(core._terminal_rate["synthetic.build"]), 20)
+
+    def test_terminal_can_use_replay_capacity_reserved_from_progress(self):
+        clock = [NOW]
+        core = Coordinator(clock=lambda: clock[0])
+        first = event(clock[0], event_id="started", idempotency_key="started",
+                      subject_id="run-one", status="started")
+        core.handle(first)
+        for index in range(3583):
+            core._seen[("other.source", f"reserved-{index}")] = (NOW + 240, first)
+        progress = event(clock[0], event_id="progress", idempotency_key="progress",
+                         subject_id="run-one", status="progress")
+        self.assertEqual(core.handle(progress)["reason"], "capacity")
+        terminal = event(clock[0], event_id="terminal", idempotency_key="terminal",
+                         subject_id="run-one", status="failed")
+        self.assertEqual(core.handle(terminal)["result"], "accepted")
+        self.assertEqual(len(core._seen), 3585)
 
     def test_retired_capacity_does_not_block_unrelated_cues(self):
         clock = [NOW]

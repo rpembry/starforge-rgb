@@ -86,9 +86,11 @@ class PolicyTests(unittest.TestCase):
     def test_rate_limit_and_unsupported(self):
         core = Coordinator({"rgb": FakeSink()}, clock=lambda: NOW)
         for i in range(10):
-            result = core.handle(event(event_id=f"e{i}", idempotency_key=f"k{i}"))
+            result = core.handle(event(event_id=f"e{i}", idempotency_key=f"k{i}",
+                                       subject_id=None))
             self.assertEqual(result["channels"]["text"], "unsupported")
-        self.assertEqual(core.handle(event(event_id="eleven", idempotency_key="eleven"))["reason"], "rate_limit")
+        self.assertEqual(core.handle(event(event_id="eleven", idempotency_key="eleven",
+                                           subject_id=None))["reason"], "rate_limit")
 
     def test_source_capability_is_host_registered(self):
         caps = SourceCapabilities(frozenset({"unknown"}), offers_text=False, offers_subject=False)
