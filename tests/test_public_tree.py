@@ -6,7 +6,7 @@ import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-ALLOWED = re.compile(r"^(?:\.gitignore|README\.md|LICENSE|pyproject\.toml|src/starforge_cues/[^/]+\.py|tests/test_[^/]+\.py|examples/[^/]+\.json|docs/[^/]+\.md|docs/adr/[^/]+\.md)$")
+ALLOWED = re.compile(r"^(?:\.gitignore|README\.md|LICENSE|pyproject\.toml|\.github/workflows/unit\.yml|src/starforge_cues/[^/]+\.py|tests/test_[^/]+\.py|examples/[^/]+\.json|docs/[^/]+\.md|docs/adr/[^/]+\.md)$")
 FORBIDDEN = (b"BEGIN " + b"PRIVATE KEY", b"ghp" + b"_", b"sk-proj" + b"-",
              b"/home/" + b"rpembry/", b"X-API-" + b"Key:")
 
