@@ -1,6 +1,7 @@
 import errno
 from contextlib import redirect_stderr
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -11,13 +12,61 @@ import time
 import unittest
 
 from starforge_cues.core import Coordinator, FakeSink
-from starforge_cues.transport import LocalServer, submit
+from starforge_cues.contract import CueEvent
+from starforge_cues.transport import LocalServer, submit, to_receipt
 
 FIXTURE = (Path(__file__).resolve().parents[1] / "examples/synthetic-cue.json").read_bytes()
 
 
+class ReceiptTests(unittest.TestCase):
+    def test_unknown_cancellation_reason_is_public_and_bounded(self):
+        mapping = {**json.loads(FIXTURE), "status": "cancelled"}
+        receipt = to_receipt(CueEvent.from_mapping(mapping),
+                             {"result": "suppressed", "reason": "unknown_subject", "channels": {}})
+        self.assertEqual(receipt["reason"], "unknown_subject")
+        self.assertEqual(receipt["channels"], {})
+
+
 @unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "POSIX Unix sockets required")
 class TransportTests(unittest.TestCase):
+    def test_cancellation_receipt_cannot_disclose_restored_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "private" / "cue.sock"
+            core = Coordinator({"text": FakeSink()}, clock=lambda: 1790985660.0)
+            try:
+                host = LocalServer(path, core)
+            except PermissionError as exc:
+                if exc.errno == errno.EPERM:
+                    self.skipTest("sandbox denies Unix socket bind")
+                raise
+            base = json.loads(FIXTURE)
+            private = {**base, "event_id": "private", "idempotency_key": "private",
+                       "source_id": "private.mail", "subject_id": "mail-one",
+                       "text": "Synthetic private body"}
+            top = {**base, "event_id": "top", "idempotency_key": "top",
+                   "source_id": "synthetic.other", "subject_id": "other-one",
+                   "severity": "critical", "text": None}
+            cancel = {**top, "event_id": "cancel", "idempotency_key": "cancel",
+                      "status": "cancelled"}
+            with host:
+                worker = threading.Thread(target=host.serve_forever, daemon=True)
+                worker.start()
+                try:
+                    own = submit(path, json.dumps(private).encode())
+                    submit(path, json.dumps(top).encode())
+                    result = submit(path, json.dumps(cancel).encode())
+                finally:
+                    host.shutdown()
+                    worker.join()
+            self.assertEqual(own["version"], 1)
+            self.assertNotIn("plan", own)
+            self.assertEqual(result["event_id"], "cancel")
+            self.assertEqual(result["channels"], {})
+            serialized = json.dumps(result)
+            self.assertNotIn("Synthetic private body", serialized)
+            self.assertNotIn("private.mail", serialized)
+            self.assertNotIn("plan", result)
+
     def test_local_socket_permissions_and_duplicate(self):
         with tempfile.TemporaryDirectory() as temp:
             parent = Path(temp) / "private"

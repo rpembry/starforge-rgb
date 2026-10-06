@@ -18,6 +18,17 @@ def event(at, **changes):
 
 
 class TextStackTests(unittest.TestCase):
+    def test_malformed_group_in_host_snapshot_cannot_break_refresh(self):
+        core = Coordinator(clock=lambda: NOW)
+        core.handle(event(NOW, event_id="group-type", idempotency_key="group-type"))
+        for malformed in (5, True):
+            with self.subTest(malformed=malformed):
+                snapshot = core.text_snapshot()
+                snapshot["entries"][0]["group"] = malformed
+                view = TextStackModel().refresh(snapshot, unlocked=True, elapsed=NOW)
+                self.assertEqual(len(view["rows"]), 1)
+                self.assertIsNone(view["rows"][0]["group"])
+
     def test_projection_sink_receipt_is_distinct_from_view_visibility(self):
         sink = TextProjectionSink()
         core = Coordinator({"text": sink}, clock=lambda: NOW)

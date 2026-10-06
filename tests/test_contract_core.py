@@ -35,6 +35,14 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             CueEvent.from_json(b'{"version":1,"version":1}')
 
+    def test_metadata_types_are_validated_per_key(self):
+        for metadata in ({"group": 5}, {"group": True}, {"label": 2},
+                         {"phase": False}, {"count": True}, {"count": "2"}):
+            with self.subTest(metadata=metadata), self.assertRaises(ContractError):
+                event(metadata=metadata)
+        self.assertEqual(event(metadata={"group": "build", "count": 2}).metadata,
+                         {"group": "build", "count": 2})
+
     def test_cli_diagnostic_redacts_untrusted_key(self):
         from starforge_cues.cli import main
         attacker_key = "private-message-" + "x" * 2000
