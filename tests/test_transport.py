@@ -12,9 +12,19 @@ import time
 import unittest
 
 from starforge_cues.core import Coordinator, FakeSink
-from starforge_cues.transport import LocalServer, submit
+from starforge_cues.contract import CueEvent
+from starforge_cues.transport import LocalServer, submit, to_receipt
 
 FIXTURE = (Path(__file__).resolve().parents[1] / "examples/synthetic-cue.json").read_bytes()
+
+
+class ReceiptTests(unittest.TestCase):
+    def test_unknown_cancellation_reason_is_public_and_bounded(self):
+        mapping = {**json.loads(FIXTURE), "status": "cancelled"}
+        receipt = to_receipt(CueEvent.from_mapping(mapping),
+                             {"result": "suppressed", "reason": "unknown_subject", "channels": {}})
+        self.assertEqual(receipt["reason"], "unknown_subject")
+        self.assertEqual(receipt["channels"], {})
 
 
 @unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "POSIX Unix sockets required")

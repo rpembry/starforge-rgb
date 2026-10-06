@@ -16,6 +16,7 @@ _RECEIPT_REASONS = frozenset({
     "capacity", "cooldown", "duplicate", "feedback_loop", "future",
     "lease_limit", "rate_limit", "replay_conflict", "self_origin",
     "source_capability", "source_limit", "stale", "receiver_scope",
+    "unknown_subject",
 })
 _CHANNEL_OUTCOMES = frozenset({
     "accepted", "failed", "unknown", "unsupported", "absent", "suppressed",
