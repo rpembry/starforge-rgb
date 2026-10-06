@@ -7,9 +7,9 @@ from threading import RLock
 from typing import Callable, Protocol
 
 from .contract import CueEvent
+from .lease_book import Lease as _Lease, LeaseBook
 
 CHANNELS = ("text", "rgb", "audio")
-MAX_SUBJECT_GENERATIONS = 2048
 MAX_REPLAY_RECORDS = 4096
 TERMINAL_REPLAY_RESERVE = 512
 TERMINAL_RATE_PER_SOURCE = 20
@@ -95,16 +95,6 @@ class QuietPolicy:
         return True
 
 
-@dataclass(frozen=True)
-class _Lease:
-    expiry: float
-    first_seen: float
-    renewals: int
-    priority: int
-    sequence: int
-    plan: dict
-
-
 class Coordinator:
     """In-memory policy; a host timer calls tick even when no event arrives."""
 
@@ -130,7 +120,10 @@ class Coordinator:
         self._lock = RLock()
         self._seen: dict[tuple[str, str], tuple[float, CueEvent]] = {}
         self._seen_events: dict[tuple[str, str], tuple[str, str]] = {}
-        self._leases: dict[tuple[str, str], _Lease] = {}
+        self._lease_book = LeaseBook(max_lease_age_s)
+        # Keep these aliases while existing host and test code reads snapshots.
+        self._leases = self._lease_book.leases
+        self._retired_subjects = self._lease_book.retired
         self._rate: dict[str, list[float]] = {}
         self._terminal_rate: dict[str, list[float]] = {}
         self._active_key: tuple[str, str] | None = None
@@ -147,7 +140,6 @@ class Coordinator:
         self._applied: dict[str, dict | None] = {}
         self._pending: dict[str, tuple[dict, int]] = {}
         self._feedback: dict[tuple[str, str], float] = {}
-        self._retired_subjects: dict[tuple[str, str], float] = {}
         self.recovery_result: dict | None = None
 
     @classmethod
@@ -280,9 +272,7 @@ class Coordinator:
         return {"result": "reconciled" if results else "unchanged", "channels": results}
 
     def _prune(self, now: float) -> None:
-        for key, end in list(self._retired_subjects.items()):
-            if end <= now:
-                del self._retired_subjects[key]
+        self._lease_book.prune_retired(now)
         for key, end in list(self._feedback.items()):
             if end <= now:
                 del self._feedback[key]
@@ -302,29 +292,10 @@ class Coordinator:
                 self._terminal_rate[source] = recent
             else:
                 del self._terminal_rate[source]
-        for key, lease in list(self._leases.items()):
-            if lease.expiry <= now:
-                del self._leases[key]
-                self._retire(key, lease, now)
-
-    def _retire(self, key: tuple[str, str], lease: _Lease, now: float) -> None:
-        # Only an explicit subject identifies a renewable run. A subjectless event
-        # has its own bounded replay record, not a long-lived generation tombstone.
-        if lease.plan["subject_id"] is None:
-            return
-        # Any end, including early expiry/cancel, blocks silent resurrection;
-        # a distinct subject explicitly starts a new run.
-        until = lease.first_seen + 2 * self.max_lease_age_s
-        if until > now:
-            # Admission reserved this slot while the subject was active.
-            # Never evict an unexpired tombstone to make room for churn.
-            self._retired_subjects[key] = until
+        self._lease_book.expire(now)
 
     def _top(self) -> tuple[str, str] | None:
-        if not self._leases:
-            return None
-        return max(self._leases, key=lambda key: (self._leases[key].priority,
-                                                  self._leases[key].sequence))
+        return self._lease_book.top()
 
     def _send(self, channel: str, plan: dict, prior_attempts: int = 0) -> str:
         sink = self.sinks.get(channel)
@@ -511,10 +482,7 @@ class Coordinator:
             if (len(self._seen) >= replay_limit or
                     (len(self._leases) >= 4096 and existing is None)):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
-            if (event.subject_id is not None and existing is None and
-                    len(self._retired_subjects) + sum(
-                        lease.plan["subject_id"] is not None for lease in self._leases.values()
-                    ) >= MAX_SUBJECT_GENERATIONS):
+            if event.subject_id is not None and not self._lease_book.has_subject_capacity(lease_key):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
             first_seen = existing.first_seen if existing else monotonic_now
             renewals = existing.renewals + 1 if existing else 0
@@ -543,9 +511,7 @@ class Coordinator:
             renewals = 0
         self._remember(key, event_key, deadline, event)
         if cancellation:
-            ended = self._leases.pop(lease_key, None)
-            if ended is not None:
-                self._retire(lease_key, ended, monotonic_now)
+            self._lease_book.cancel(lease_key, monotonic_now)
             reconciliation = self._reconcile()
             return {"result": "accepted", "reason": None, "plan": reconciliation.get("plan"),
                     "channels": reconciliation["channels"]}
@@ -560,8 +526,8 @@ class Coordinator:
                 "group": event.metadata.get("group"), "count": event.metadata.get("count"),
                 "expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat(),
                 "baseline": event.cue_id}
-        self._leases[lease_key] = _Lease(deadline, first_seen, renewals, {"info": 1, "warning": 2,
-                                                 "critical": 3}[event.severity], self._sequence, plan)
+        self._lease_book.put(lease_key, _Lease(deadline, first_seen, renewals, {"info": 1, "warning": 2,
+                                                     "critical": 3}[event.severity], self._sequence, plan))
         if self._top() != lease_key:
             return {"result": "accepted", "reason": None, "plan": plan,
                     "channels": {channel: "preempted" for channel in CHANNELS}}
