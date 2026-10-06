@@ -65,15 +65,36 @@ class PrinterCompletionTests(unittest.TestCase):
                          "out_of_order")
         old = datetime.fromtimestamp(NOW.timestamp() - 30, timezone.utc)
         self.assertEqual(adapter.observe(report(2, "finished", "job-1", at=old)).reason,
-                         "stale_or_future")
-        self.assertEqual(adapter.observe(report(3, "finished", "job-1")).reason,
-                         "unproven_terminal")
+                         "out_of_order")
+        self.assertEqual(adapter.observe(report(3, "finished", "job-1")).outcome,
+                         "emitted")
         future = datetime.fromtimestamp(NOW.timestamp() + 6, timezone.utc)
         self.assertEqual(adapter.observe(report(4, "printing", "job-2", at=future)).reason,
                          "stale_or_future")
         adapter.observe(report(5, "printing", "job-2"))
         adapter.observe(report(6, "unknown"))
         self.assertEqual(adapter.observe(report(7, "failed", "job-2")).reason,
+                         "unproven_terminal")
+
+    def test_old_stale_packet_does_not_erase_newer_printing_proof(self):
+        adapter = self.make_adapter()
+        adapter.observe(report(5, "printing", "job-1"))
+        old = datetime.fromtimestamp(NOW.timestamp() - 30, timezone.utc)
+        self.assertEqual(adapter.observe(report(2, "printing", "job-1", at=old)).reason,
+                         "out_of_order")
+        self.assertEqual(adapter.observe(report(6, "finished", "job-1")).outcome,
+                         "emitted")
+
+    def test_in_order_stale_packet_breaks_printing_proof(self):
+        clock = [NOW.timestamp()]
+        adapter = BambuCompletionAdapter("printer.bambu-p1s", clock=lambda: clock[0])
+        adapter.observe(report(1, "printing", "job-1"))
+        clock[0] += 30
+        delayed = datetime.fromtimestamp(NOW.timestamp() + 5, timezone.utc)
+        self.assertEqual(adapter.observe(report(2, "printing", "job-1", at=delayed)).reason,
+                         "stale_or_future")
+        current = datetime.fromtimestamp(clock[0], timezone.utc)
+        self.assertEqual(adapter.observe(report(3, "finished", "job-1", at=current)).reason,
                          "unproven_terminal")
 
     def test_job_switch_and_replay_ids_are_bounded(self):
