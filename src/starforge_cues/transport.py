@@ -98,6 +98,7 @@ class LocalServer(socketserver.ThreadingMixIn, getattr(socketserver, "UnixStream
     daemon_threads = True
     block_on_close = False
     request_queue_size = 16
+    handler_class = _Handler
 
     def __init__(self, path: Path, coordinator: Coordinator | None = None,
                  event_filter: Callable[[CueEvent], bool] | None = None):
@@ -112,7 +113,7 @@ class LocalServer(socketserver.ThreadingMixIn, getattr(socketserver, "UnixStream
         self.coordinator = coordinator or Coordinator({channel: FakeSink() for channel in CHANNELS})
         self.event_filter = event_filter
         self._slots = BoundedSemaphore(16)
-        super().__init__(str(path), _Handler)
+        super().__init__(str(path), self.handler_class)
         os.chmod(path, 0o600)
         info = path.lstat()
         self._socket_identity = (info.st_dev, info.st_ino)
