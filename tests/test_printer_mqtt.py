@@ -18,6 +18,7 @@ from starforge_cues.printer_mqtt import (
     MAX_STATE_LEASE_S, _packet, _read_packet, collect_once, diagnostic_code, parse_fingerprint,
     read_private_access_code, validate_address,
 )
+from starforge_cues.printer_status import PrinterObservation
 
 
 class Clock:
@@ -124,6 +125,20 @@ class ReportTests(unittest.TestCase):
         self.normalizer.accept(b'{"print":{"mc_percent":42}}')
         self.assertEqual(self.normalizer.accept(report("FINISH")).reason,
                          "duplicate_terminal")
+
+    def test_sparse_deltas_and_old_packet_preserve_newer_completion_proof(self):
+        self.assertEqual(self.normalizer.accept(report("RUNNING")).reason, "active")
+        older = PrinterObservation(
+            self.normalizer.epoch, 0,
+            datetime.fromtimestamp(self.clock.value - 30, timezone.utc),
+            "printing", self.normalizer.adapter.active_job_id)
+        self.assertEqual(self.normalizer.adapter.observe(older).reason, "out_of_order")
+        for _ in range(43):
+            self.clock.tick(2)
+            self.assertEqual(self.normalizer.accept(b'{"print":{"mc_percent":42}}').reason,
+                             "no_state")
+        self.clock.tick(2)
+        self.assertEqual(self.normalizer.accept(report("FINISH")).outcome, "emitted")
 
     def test_packet_gap_and_state_lease_expire_partial_delta_proof(self):
         self.normalizer.accept(report("RUNNING"))
