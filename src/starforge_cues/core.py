@@ -9,7 +9,7 @@ from typing import Callable, Protocol
 from .contract import CueEvent
 
 CHANNELS = ("text", "rgb", "audio")
-MAX_RETIRED_SUBJECTS = 2048
+MAX_SUBJECT_GENERATIONS = 2048
 
 
 def _valid_baseline_text(text: str | None) -> bool:
@@ -305,8 +305,8 @@ class Coordinator:
         # a distinct subject explicitly starts a new run.
         until = lease.first_seen + 2 * self.max_lease_age_s
         if until > now:
-            while key not in self._retired_subjects and len(self._retired_subjects) >= MAX_RETIRED_SUBJECTS:
-                self._retired_subjects.pop(next(iter(self._retired_subjects)))
+            # Admission reserved this slot while the subject was active.
+            # Never evict an unexpired tombstone to make room for churn.
             self._retired_subjects[key] = until
 
     def _top(self) -> tuple[str, str] | None:
@@ -493,6 +493,11 @@ class Coordinator:
                 return {"result": "suppressed", "reason": "source_limit", "channels": {}}
             if (len(self._seen) >= 4096 or
                     (len(self._leases) >= 4096 and lease_key not in self._leases)):
+                return {"result": "suppressed", "reason": "capacity", "channels": {}}
+            if (event.subject_id is not None and lease_key not in self._leases and
+                    len(self._retired_subjects) + sum(
+                        lease.plan["subject_id"] is not None for lease in self._leases.values()
+                    ) >= MAX_SUBJECT_GENERATIONS):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
             recent = self._rate.get(event.source_id, [])
             if self.cooldown_seconds and recent and monotonic_now - recent[-1] < self.cooldown_seconds:
