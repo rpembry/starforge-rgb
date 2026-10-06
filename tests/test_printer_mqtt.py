@@ -284,6 +284,34 @@ class ProbeDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic_code(CollectorError("private/path/to/secret")),
                          "mqtt_protocol_or_report_error")
 
+    def test_x509_verify_code_is_bounded_and_never_exposes_raw_reason(self):
+        failure = ssl.SSLCertVerificationError(1, "private/path/and/raw/cert/reason")
+        failure.verify_code = 79
+        context = Mock()
+        context.wrap_socket.side_effect = failure
+        raw = Mock()
+        with patch("starforge_cues.printer_mqtt.ssl.create_default_context",
+                   return_value=context), patch(
+                       "starforge_cues.printer_mqtt.socket.create_connection",
+                       return_value=raw):
+            with self.assertRaises(CollectorError) as caught:
+                _open_tls("192.168.1.2", Path("synthetic-ca"))
+        self.assertEqual(diagnostic_code(caught.exception),
+                         "tls_ca_validation_failed_x509_79")
+        self.assertEqual(diagnostic_code(CollectorError(
+            "tls_ca_validation_failed", verify_code=10000)), "tls_ca_validation_failed")
+        self.assertEqual(diagnostic_code(CollectorError(
+            "tls_ca_validation_failed", verify_code=True)), "tls_ca_validation_failed")
+        from starforge_cues.cli import main
+        output = io.StringIO()
+        with patch("starforge_cues.printer_mqtt.probe_certificate",
+                   side_effect=caught.exception), contextlib.redirect_stderr(output):
+            status = main(["printer-cert-probe", "--host", "192.168.1.2",
+                           "--ca-file", "private/path/to/ca"])
+        self.assertEqual(status, 2)
+        self.assertEqual(output.getvalue().strip(),
+                         "printer probe failed: tls_ca_validation_failed_x509_79")
+
 
 if __name__ == "__main__":
     unittest.main()

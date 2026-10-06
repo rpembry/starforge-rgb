@@ -30,6 +30,10 @@ _PRIVATE_NETS = tuple(ipaddress.ip_network(value) for value in
 class CollectorError(ValueError):
     """A generic setup or protocol error that never includes private values."""
 
+    def __init__(self, message: str, *, verify_code: int | None = None):
+        super().__init__(message)
+        self.verify_code = verify_code if type(verify_code) is int and 1 <= verify_code <= 999 else None
+
 
 _DIAGNOSTICS = {
     "printer address must be a private IPv4 address": "invalid_private_ipv4",
@@ -51,6 +55,8 @@ def diagnostic_code(exc: Exception) -> str:
     """Return only fixed categories, never exception details or host paths."""
     if isinstance(exc, CollectorError):
         message = str(exc)
+        if message == "tls_ca_validation_failed" and exc.verify_code is not None:
+            return f"tls_ca_validation_failed_x509_{exc.verify_code}"
         if message in _DIAGNOSTICS:
             return _DIAGNOSTICS[message]
         if message in {
@@ -312,7 +318,8 @@ def _open_tls(host: str, ca_file: Path):
     except Exception as exc:
         raw.close()
         if isinstance(exc, ssl.SSLCertVerificationError):
-            raise CollectorError("tls_ca_validation_failed") from exc
+            raise CollectorError("tls_ca_validation_failed",
+                                 verify_code=getattr(exc, "verify_code", None)) from exc
         if isinstance(exc, TimeoutError):
             raise CollectorError("tls_timeout") from exc
         if isinstance(exc, ssl.SSLError):
