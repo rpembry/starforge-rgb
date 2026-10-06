@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Callable, Protocol
 
 from .contract import CueEvent
+from .channel_select import ranked_live
 from .lease_book import Lease as _Lease, LeaseBook
 
 CHANNELS = ("text", "rgb", "audio")
@@ -399,8 +400,7 @@ class Coordinator:
                 return {"quiet": True, "total": 0, "source_totals": {},
                         "active_revisions": [], "entries": []}
             now = self.monotonic_clock()
-            live = [(key, lease) for key, lease in self._leases.items() if lease.expiry > now]
-            live.sort(key=lambda item: (item[1].priority, item[1].sequence), reverse=True)
+            live = ranked_live(self._leases, now)
             source_totals: dict[str, int] = {}
             active_revisions = []
             for key, lease in live:

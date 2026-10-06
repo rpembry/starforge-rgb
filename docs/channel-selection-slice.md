@@ -1,0 +1,7 @@
+# Pure channel-selection slice (#51)
+
+`channel_select.select_channels` reads one supplied lease snapshot and returns only internal lease keys: ordered live text entries, the sustained RGB winner, and an admitted one-shot audio candidate. It has no sink, transport, thread, queue, baseline mutation or device I/O. Host-owned booleans pass per-channel quiet/capability permission, and an explicit unlocked flag fails text closed. A lower RGB-priority admitted cue can be an audio candidate; a repeated `needs_attention` decision, cancellation, or expired lease cannot.
+
+`LeaseBook.top()` now uses the selector's RGB ranking function, and `Coordinator.text_snapshot()` uses its live priority order. These replace the previous duplicate ranking expressions without changing current sink dispatch or v1 receipts. The audio candidate is exercised only by fake selector tests in this slice; connecting it to dispatch would change audible policy and needs separate review. The existing text view dismissal still keys revisions, so the stable generation-keyed dismissal from [the channel contract](channel-decision-contract.md) must be implemented and tested before connecting the new text selection to a live view.
+
+The remaining #51 work is selecting per-channel plans in `Coordinator` and proving the receipt change. Async workers, revision status and barriers are #54 and require their own fake tests and contract recheck. No real output adapter is activated here.
