@@ -73,6 +73,15 @@ class BambuCompletionAdapter:
         self._active_job: str | None = None
         self._terminal: OrderedDict[str, None] = OrderedDict()
 
+    @property
+    def active_job_id(self) -> str | None:
+        """Opaque in-memory identity of the job with live transition proof."""
+        return self._active_job
+
+    def invalidate_active_proof(self) -> None:
+        """Erase host-observed proof even if wall-clock ordering rejects a report."""
+        self._active_job = None
+
     def observe(self, item: PrinterObservation) -> PrinterDecision:
         if not isinstance(item, PrinterObservation):
             raise TypeError("expected normalized printer observation")
