@@ -1,7 +1,10 @@
 """Pure proposed ingress types; the current socket does not use them yet."""
 
 from dataclasses import dataclass
+from collections import OrderedDict
+import math
 import re
+from typing import Mapping
 
 from .contract import ContractError, CueEvent, _STATUS, _SEVERITY, _identifier
 
@@ -9,6 +12,9 @@ from .contract import ContractError, CueEvent, _STATUS, _SEVERITY, _identifier
 _EPOCH = re.compile(r"[0-9a-f]{32}\Z")
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _CONFIDENCE_RANK = {"unknown": 0, "inferred": 1, "known": 2}
+MAX_RETRACT_REQUESTS = 4096
+MAX_RETRACT_REQUESTS_PER_BINDING = 256
+RETRACT_REPLAY_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -79,10 +85,13 @@ class RetractFrame:
     source_id: str
     subject_id: str
     request_id: str
+    expected_generation: GenerationRef
 
     def __post_init__(self):
         for name in ("source_id", "subject_id", "request_id"):
             _identifier(getattr(self, name), name)
+        if not isinstance(self.expected_generation, GenerationRef):
+            raise ValueError("invalid expected generation")
 
 
 @dataclass(frozen=True)
@@ -103,11 +112,19 @@ def parse_frame(value: object) -> Frame:
             raise ContractError("frame: invalid fields")
         return PublishFrame(CueEvent.from_mapping(value["event"]))
     if op == "retract":
-        if value.keys() != {"proto", "op", "source_id", "subject_id", "request_id"}:
+        if value.keys() != {"proto", "op", "source_id", "subject_id", "request_id",
+                            "expected_generation"}:
             raise ContractError("frame: invalid fields")
+        expected = value["expected_generation"]
+        if not isinstance(expected, dict) or expected.keys() != {"process_epoch", "ordinal"}:
+            raise ContractError("generation: invalid")
+        try:
+            generation = GenerationRef(expected["process_epoch"], expected["ordinal"])
+        except ValueError as exc:
+            raise ContractError("generation: invalid") from exc
         return RetractFrame(_identifier(value["source_id"], "source_id"),
                             _identifier(value["subject_id"], "subject_id"),
-                            _identifier(value["request_id"], "request_id"))
+                            _identifier(value["request_id"], "request_id"), generation)
     if op == "hello":
         if value.keys() != {"proto", "op"}:
             raise ContractError("frame: invalid fields")
@@ -138,6 +155,7 @@ class IngressBinding:
                 not isinstance(self.max_severity, str) or self.max_severity not in _SEVERITY or
                 not isinstance(self.max_confidence, str) or
                 self.max_confidence not in _CONFIDENCE_RANK or
+                (self.can_retract and not self.offers_subject) or
                 any(type(flag) is not bool for flag in
                     (self.offers_text, self.offers_subject, self.can_retract))):
             raise ValueError("invalid ingress binding")
@@ -150,8 +168,26 @@ class BoundFrame:
     binding_id: str
     frame: Frame
 
+    def __post_init__(self):
+        _identifier(self.binding_id, "binding_id")
+        if not isinstance(self.frame, (PublishFrame, RetractFrame, HelloFrame)):
+            raise ValueError("invalid bound frame")
 
-def authorize_frame(binding: IngressBinding, frame: Frame) -> BoundFrame:
+
+@dataclass(frozen=True)
+class OwnedGeneration:
+    binding_id: str
+    generation: GenerationRef
+
+    def __post_init__(self):
+        _identifier(self.binding_id, "binding_id")
+        if not isinstance(self.generation, GenerationRef):
+            raise ValueError("invalid owned generation")
+
+
+def authorize_frame(binding: IngressBinding, frame: Frame,
+                    owned_generations: Mapping[tuple[str, str], OwnedGeneration] | None = None
+                    ) -> BoundFrame:
     """Check only static scope; an ingress adapter must establish the binding."""
     if not isinstance(binding, IngressBinding):
         raise TypeError("host binding required")
@@ -172,6 +208,52 @@ def authorize_frame(binding: IngressBinding, frame: Frame) -> BoundFrame:
     elif isinstance(frame, RetractFrame):
         if not binding.can_retract or frame.source_id not in binding.source_ids:
             raise ContractError("binding: retract outside scope")
+        owner = (owned_generations or {}).get((frame.source_id, frame.subject_id))
+        if (not isinstance(owner, OwnedGeneration) or
+                owner.binding_id != binding.binding_id or
+                owner.generation != frame.expected_generation):
+            raise ContractError("binding: retract generation mismatch")
     elif not isinstance(frame, HelloFrame):
         raise ContractError("binding: unsupported frame")
     return BoundFrame(binding.binding_id, frame)
+
+
+class RetractionReplay:
+    """Bounded binding-scoped request IDs; call under the host admission lock."""
+
+    def __init__(self):
+        self._seen: OrderedDict[tuple[str, str], tuple[float, RetractFrame]] = OrderedDict()
+        self._binding_counts: dict[str, int] = {}
+        self._last_now = float("-inf")
+
+    def _prune(self, now: float) -> None:
+        if type(now) not in (int, float) or not math.isfinite(now) or now < self._last_now:
+            raise ValueError("retraction replay requires monotonic time")
+        self._last_now = now
+        while self._seen and next(iter(self._seen.values()))[0] <= now:
+            key, _record = self._seen.popitem(last=False)
+            binding_id = key[0]
+            remaining = self._binding_counts[binding_id] - 1
+            if remaining:
+                self._binding_counts[binding_id] = remaining
+            else:
+                del self._binding_counts[binding_id]
+
+    def classify(self, bound: BoundFrame, now: float) -> str:
+        if not isinstance(bound, BoundFrame) or not isinstance(bound.frame, RetractFrame):
+            raise TypeError("bound retract frame required")
+        self._prune(now)
+        previous = self._seen.get((bound.binding_id, bound.frame.request_id))
+        if previous is not None:
+            return "duplicate" if previous[1] == bound.frame else "conflict"
+        return ("capacity" if len(self._seen) >= MAX_RETRACT_REQUESTS or
+                self._binding_counts.get(bound.binding_id, 0) >= MAX_RETRACT_REQUESTS_PER_BINDING
+                else "new")
+
+    def remember(self, bound: BoundFrame, now: float) -> str:
+        outcome = self.classify(bound, now)
+        if outcome == "new":
+            self._seen[(bound.binding_id, bound.frame.request_id)] = (
+                now + RETRACT_REPLAY_SECONDS, bound.frame)
+            self._binding_counts[bound.binding_id] = self._binding_counts.get(bound.binding_id, 0) + 1
+        return outcome
