@@ -14,8 +14,8 @@ class RuntimePathError(ValueError):
     pass
 
 
-def validate_runtime_root(root: Path) -> Path:
-    """Require an explicit private directory under nonreplaceable ancestors."""
+def _validate_runtime_root(root: Path, uid: int, lstat) -> Path:
+    """Pure path walk; production passes real lstat and effective UID."""
     root = Path(root)
     if not root.is_absolute() or ".." in root.parts or root == Path("/"):
         raise RuntimePathError("runtime root must be an absolute private directory")
@@ -23,21 +23,26 @@ def validate_runtime_root(root: Path) -> Path:
     for part in root.parts[1:]:
         current = current / part
         try:
-            info = current.lstat()
+            info = lstat(current)
         except OSError as exc:
             raise RuntimePathError("runtime ancestor unavailable") from exc
         if not stat.S_ISDIR(info.st_mode):
             raise RuntimePathError("runtime ancestor is not a directory")
         if current == root:
-            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            if info.st_uid != uid or stat.S_IMODE(info.st_mode) & 0o077:
                 raise RuntimePathError("runtime root is not private")
-        elif info.st_uid not in (0, os.geteuid()):
+        elif info.st_uid not in (0, uid):
             raise RuntimePathError("runtime ancestor has untrusted owner")
         elif stat.S_IMODE(info.st_mode) & 0o022:
             # A root-owned sticky /tmp is the only writable ancestor admitted.
             if info.st_uid != 0 or not info.st_mode & stat.S_ISVTX:
                 raise RuntimePathError("runtime ancestor is writable")
     return root
+
+
+def validate_runtime_root(root: Path) -> Path:
+    """Require an explicit private directory under nonreplaceable ancestors."""
+    return _validate_runtime_root(root, os.geteuid(), lambda path: path.lstat())
 
 
 class RegisteredHost:
@@ -55,6 +60,7 @@ class RegisteredHost:
                                         binding.offers_subject)
         if (not isinstance(coordinator, Coordinator) or
                 coordinator.sources != {source_id: capability} or
+                coordinator._ever_handled or
                 coordinator._seen or coordinator._leases or coordinator._retired_subjects or
                 coordinator._rate or coordinator._terminal_rate or coordinator._feedback):
             raise ValueError("fresh coordinator with this exact source registry required")
