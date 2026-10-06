@@ -443,13 +443,17 @@ class SessionSummaryTests(unittest.TestCase):
     def test_partial_and_unsupported_reports_have_bounded_reasons(self):
         summary, events = self.run_session([
             b'{"other":"private-text"}', b'{"print":{"mc_percent":42}}',
-            report("FAILED"), b'{"print":',
+            report("FAILED"), report("RUNNING", None), b'{"print":',
         ])
-        self.assertEqual(summary["report_count"], 4)
+        self.assertEqual(summary["report_count"], 5)
         self.assertEqual(summary["normalized_state_count"], 0)
         self.assertEqual(summary["last_generic_state"], "unknown")
         self.assertEqual(summary["reason_counts"], {
-            "invalid_report": 1, "no_print_report": 1, "no_state": 1, "unknown": 1,
+            "invalid_report": 1, "no_print_report": 1, "no_state": 1, "unknown": 2,
+        })
+        self.assertEqual(summary["issue_counts"], {
+            "invalid_report": 1, "no_print_report": 1, "no_state": 1,
+            "unsupported_state": 1, "missing_or_invalid_task": 1,
         })
         self.assertNotIn("private-text", repr(summary))
         self.assertEqual(events, [])

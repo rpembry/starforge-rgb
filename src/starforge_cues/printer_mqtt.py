@@ -160,6 +160,7 @@ class P1ReportNormalizer:
         self.last_state_at: float | None = None
         self.last_input_state: str | None = None
         self.last_input_at: float | None = None
+        self.last_input_issue: str | None = None
         self.normalized_state_count = 0
         self.is_connected = False
 
@@ -173,6 +174,7 @@ class P1ReportNormalizer:
         self.last_state_at = None
         self.last_input_state = None
         self.last_input_at = None
+        self.last_input_issue = None
         self.normalized_state_count = 0
         self.is_connected = True
 
@@ -194,9 +196,11 @@ class P1ReportNormalizer:
         if not self.is_connected:
             raise CollectorError("collector is disconnected")
         now = self.monotonic()
+        self.last_input_issue = None
         if not isinstance(raw, bytes) or len(raw) > MAX_REPORT:
             self.last_state_at = None
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "invalid_report"
             self._observe("unknown", None)
             raise CollectorError("report exceeds size bound")
         if self.last_state_at is not None and (now < self.last_state_at or
@@ -209,27 +213,34 @@ class P1ReportNormalizer:
         except (UnicodeError, ValueError) as exc:
             self.last_state_at = None
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "invalid_report"
             self._observe("unknown", None)
             raise CollectorError("invalid report JSON") from exc
         if not isinstance(data, dict) or ("print" in data and
                                            not isinstance(data["print"], dict)):
             self.last_state_at = None
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "invalid_print_shape"
             return self._observe("unknown", None)
         if "print" not in data:
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "no_print_report"
             return PrinterDecision("suppressed", "no_print_report")
         report = data["print"]
         raw_state = report.get("gcode_state")
         if raw_state is None:
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "no_state"
             return PrinterDecision("suppressed", "no_state")
         if not isinstance(raw_state, str):
             self.last_state_at = None
             self.last_input_state, self.last_input_at = "unknown", now
+            self.last_input_issue = "invalid_state_type"
             return self._observe("unknown", None)
         state = {"RUNNING": "printing", "PAUSE": "paused", "FINISH": "finished",
                  "IDLE": "idle"}.get(raw_state, "unknown")
+        if state == "unknown":
+            self.last_input_issue = "unsupported_state"
         # P1S failure is not documented by the integration's device triggers.
         # FAILED, cancellation, and all other states stay unknown pending evidence.
         task = report.get("task_id")
@@ -237,6 +248,7 @@ class P1ReportNormalizer:
             if not isinstance(task, str) or not _TASK.fullmatch(task):
                 state = "unknown"
                 task = None
+                self.last_input_issue = "missing_or_invalid_task"
             else:
                 task = "j" + hashlib.sha256(task.encode("ascii")).hexdigest()[:32]
         else:
@@ -461,6 +473,10 @@ _SUMMARY_REASONS = frozenset({
     "invalid_report", "unproven_terminal", "duplicate_terminal",
     "stale_or_future", "out_of_order",
 })
+_SUMMARY_ISSUES = frozenset({
+    "invalid_report", "invalid_print_shape", "no_print_report", "no_state",
+    "invalid_state_type", "unsupported_state", "missing_or_invalid_task",
+})
 
 
 def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
@@ -472,7 +488,14 @@ def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
     reports = 0
     events = 0
     reasons: dict[str, int] = {}
+    issues: dict[str, int] = {}
     exit_reason = "stream_ended"
+
+    def count_issue() -> None:
+        issue = normalizer.last_input_issue
+        if issue in _SUMMARY_ISSUES:
+            issues[issue] = min(issues.get(issue, 0) + 1, 999999)
+
     try:
         with client:
             normalizer.connected()
@@ -481,9 +504,11 @@ def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
                 try:
                     decision = normalizer.accept(raw)
                 except CollectorError:
+                    count_issue()
                     reasons["invalid_report"] = min(reasons.get("invalid_report", 0) + 1,
                                                     999999)
                     continue
+                count_issue()
                 if decision.reason in _SUMMARY_REASONS:
                     reasons[decision.reason] = min(reasons.get(decision.reason, 0) + 1,
                                                    999999)
@@ -513,6 +538,7 @@ def collect_once(client: SubscribeOnlyP1Client, normalizer: P1ReportNormalizer,
             "last_state_age_seconds": age,
             "last_state_fresh": age_exact is not None and age_exact <= 20,
             "reason_counts": dict(sorted(reasons.items())),
+            "issue_counts": dict(sorted(issues.items())),
             "duration_seconds": max(0, min(999999, int(ended - started))),
             "exit": exit_reason,
         }
