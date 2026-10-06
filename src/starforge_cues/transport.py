@@ -12,6 +12,40 @@ from typing import Callable
 from .contract import ContractError, CueEvent, MAX_BYTES
 from .core import Coordinator, FakeSink, CHANNELS
 
+_RECEIPT_REASONS = frozenset({
+    "capacity", "cooldown", "duplicate", "feedback_loop", "future",
+    "lease_limit", "rate_limit", "replay_conflict", "self_origin",
+    "source_capability", "source_limit", "stale", "receiver_scope",
+})
+_CHANNEL_OUTCOMES = frozenset({
+    "accepted", "failed", "unknown", "unsupported", "absent", "suppressed",
+    "preempted",
+})
+
+
+def to_receipt(event: CueEvent, internal: dict) -> dict:
+    """Project only the caller's outcome; never return an internal render plan."""
+    result = internal.get("result")
+    if not isinstance(result, str) or result not in {"accepted", "suppressed", "rejected"}:
+        result = "rejected"
+    reason = internal.get("reason")
+    if reason is not None and (not isinstance(reason, str) or reason not in _RECEIPT_REASONS):
+        reason = "internal"
+    channels = internal.get("channels", {})
+    if not isinstance(channels, dict):
+        channels = {}
+    # Cancellation reconciliation belongs to whichever other lease became
+    # visible; it is never part of this producer's receipt.
+    if event.status == "cancelled" or (channels and all(
+            value == "preempted" for value in channels.values())):
+        channels = {}
+    else:
+        channels = {channel: channels[channel] for channel in CHANNELS
+                    if isinstance(channels.get(channel), str) and
+                    channels[channel] in _CHANNEL_OUTCOMES}
+    return {"version": 1, "event_id": event.event_id, "result": result,
+            "reason": reason, "channels": channels}
+
 
 def default_socket() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -44,11 +78,13 @@ class _Handler(socketserver.StreamRequestHandler):
             except Exception:
                 permitted = False
             if not permitted:
-                response = {"result": "rejected", "reason": "receiver_scope", "channels": {}}
+                internal = {"result": "rejected", "reason": "receiver_scope", "channels": {}}
             else:
-                response = self.server.coordinator.handle(event)
-        except ContractError as exc:
-            response = {"result": "rejected", "reason": str(exc), "channels": {}}
+                internal = self.server.coordinator.handle(event)
+            response = to_receipt(event, internal)
+        except ContractError:
+            response = {"version": 1, "event_id": None, "result": "rejected",
+                        "reason": "invalid_event", "channels": {}}
         except (OSError, TimeoutError):
             return
         try:

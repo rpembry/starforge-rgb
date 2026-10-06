@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 
 def _visible_text(value: str | None) -> str | None:
-    if value is None:
+    if not isinstance(value, str):
         return None
     return "".join(char if char.isprintable() or char in "\n\t" else "\ufffd" for char in value)
 
@@ -105,7 +105,7 @@ class TextStackModel:
         for entry in entries:
             if (entry["entry_id"], entry["revision"]) in self._dismissed:
                 continue
-            group = entry["group"]
+            group = entry["group"] if isinstance(entry["group"], str) else None
             row_id = (f"group:{entry['source_id']}/{group}" if group is not None
                       else f"entry:{entry['entry_id']}")
             groups.setdefault(row_id, []).append(entry)

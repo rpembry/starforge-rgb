@@ -93,7 +93,11 @@ class CueEvent:
             _identifier(key, "metadata key")
             if key not in {"label", "phase", "group", "count"}:
                 raise ContractError("metadata: unsupported key")
-            if not isinstance(item, (str, int, bool)) or (isinstance(item, str) and len(item) > 80) or (type(item) is int and abs(item) > 1_000_000):
+            if key == "count":
+                valid = type(item) is int and abs(item) <= 1_000_000
+            else:
+                valid = isinstance(item, str) and len(item) <= 80
+            if not valid:
                 raise ContractError("metadata: invalid value")
         occurred = _time(value["occurred_at"], "occurred_at")
         observed = _time(value["observed_at"], "observed_at")
