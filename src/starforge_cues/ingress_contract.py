@@ -211,26 +211,45 @@ def authorize_frame(binding: IngressBinding, frame: Frame) -> BoundFrame:
     return BoundFrame(binding.binding_id, frame)
 
 
+@dataclass(frozen=True, eq=False)
+class RetractionReservation:
+    """Process-local handle issued only when a new request ID is reserved."""
+
+    binding_id: str
+    request_id: str
+
+
+@dataclass
+class _ReplayRecord:
+    expiry: float
+    frame: RetractFrame
+    reservation: RetractionReservation
+    completed: bool = False
+
+
 class RetractionReplay:
     """Bounded binding-scoped request IDs; call under the host admission lock."""
 
     def __init__(self):
-        self._seen: OrderedDict[tuple[str, str], tuple[float, RetractFrame]] = OrderedDict()
+        self._seen: OrderedDict[tuple[str, str], _ReplayRecord] = OrderedDict()
         self._binding_counts: dict[str, int] = {}
         self._last_now = float("-inf")
+
+    def _remove(self, key: tuple[str, str]) -> None:
+        del self._seen[key]
+        binding_id = key[0]
+        remaining = self._binding_counts[binding_id] - 1
+        if remaining:
+            self._binding_counts[binding_id] = remaining
+        else:
+            del self._binding_counts[binding_id]
 
     def _prune(self, now: float) -> None:
         if type(now) not in (int, float) or not math.isfinite(now) or now < self._last_now:
             raise ValueError("retraction replay requires monotonic time")
         self._last_now = now
-        while self._seen and next(iter(self._seen.values()))[0] <= now:
-            key, _record = self._seen.popitem(last=False)
-            binding_id = key[0]
-            remaining = self._binding_counts[binding_id] - 1
-            if remaining:
-                self._binding_counts[binding_id] = remaining
-            else:
-                del self._binding_counts[binding_id]
+        while self._seen and next(iter(self._seen.values())).expiry <= now:
+            self._remove(next(iter(self._seen)))
 
     def classify(self, bound: BoundFrame, now: float) -> str:
         if not isinstance(bound, BoundFrame) or not isinstance(bound.frame, RetractFrame):
@@ -238,36 +257,46 @@ class RetractionReplay:
         self._prune(now)
         previous = self._seen.get((bound.binding_id, bound.frame.request_id))
         if previous is not None:
-            return "duplicate" if previous[1] == bound.frame else "conflict"
+            return "duplicate" if previous.frame == bound.frame else "conflict"
         return ("capacity" if len(self._seen) >= MAX_RETRACT_REQUESTS or
                 self._binding_counts.get(bound.binding_id, 0) >= MAX_RETRACT_REQUESTS_PER_BINDING
                 else "new")
 
-    def remember(self, bound: BoundFrame, now: float) -> str:
+    def remember(self, bound: BoundFrame, now: float) -> RetractionReservation | str:
         outcome = self.classify(bound, now)
         if outcome == "new":
-            self._seen[(bound.binding_id, bound.frame.request_id)] = (
-                now + RETRACT_REPLAY_SECONDS, bound.frame)
+            reservation = RetractionReservation(bound.binding_id, bound.frame.request_id)
+            self._seen[(bound.binding_id, bound.frame.request_id)] = _ReplayRecord(
+                now + RETRACT_REPLAY_SECONDS, bound.frame, reservation)
             self._binding_counts[bound.binding_id] = self._binding_counts.get(bound.binding_id, 0) + 1
+            return reservation
         return outcome
 
-    def forget_failed_reservation(self, bound: BoundFrame) -> None:
-        """Roll back a new request if its in-lock retraction did not execute."""
-        key = (bound.binding_id, bound.frame.request_id)
-        previous = self._seen.get(key)
-        if previous is None or previous[1] != bound.frame:
-            return
-        del self._seen[key]
-        remaining = self._binding_counts[bound.binding_id] - 1
-        if remaining:
-            self._binding_counts[bound.binding_id] = remaining
-        else:
-            del self._binding_counts[bound.binding_id]
+    def complete(self, reservation: RetractionReservation) -> bool:
+        """Commit a successful in-lock retraction; preserve its replay record."""
+        if not isinstance(reservation, RetractionReservation):
+            return False
+        record = self._seen.get((reservation.binding_id, reservation.request_id))
+        if record is None or record.reservation is not reservation or record.completed:
+            return False
+        record.completed = True
+        return True
+
+    def rollback(self, reservation: RetractionReservation) -> bool:
+        """Only the exact pending new-request handle may remove its record."""
+        if not isinstance(reservation, RetractionReservation):
+            return False
+        key = (reservation.binding_id, reservation.request_id)
+        record = self._seen.get(key)
+        if record is None or record.reservation is not reservation or record.completed:
+            return False
+        self._remove(key)
+        return True
 
 
 def admit_retraction(binding: IngressBinding, frame: RetractFrame,
                      owned_generations: Mapping[tuple[str, str], OwnedGeneration],
-                     replay: RetractionReplay, now: float) -> str:
+                     replay: RetractionReplay, now: float) -> RetractionReservation | str:
     """Classify and reserve one retract under the host lock; do not execute it.
 
     A recorded exact retry is acknowledged before current ownership is checked,
