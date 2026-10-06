@@ -4,6 +4,9 @@
 !/README.md
 !/LICENSE
 !/pyproject.toml
+!/.github/
+!/.github/workflows/
+!/.github/workflows/unit.yml
 !/src/
 !/src/starforge_cues/
 !/src/starforge_cues/*.py
