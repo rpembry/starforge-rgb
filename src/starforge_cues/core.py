@@ -10,6 +10,10 @@ from .contract import CueEvent
 
 CHANNELS = ("text", "rgb", "audio")
 MAX_SUBJECT_GENERATIONS = 2048
+MAX_REPLAY_RECORDS = 4096
+TERMINAL_REPLAY_RESERVE = 512
+TERMINAL_RATE_PER_SOURCE = 20
+TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
 
 
 def _valid_baseline_text(text: str | None) -> bool:
@@ -128,6 +132,7 @@ class Coordinator:
         self._seen_events: dict[tuple[str, str], tuple[str, str]] = {}
         self._leases: dict[tuple[str, str], _Lease] = {}
         self._rate: dict[str, list[float]] = {}
+        self._terminal_rate: dict[str, list[float]] = {}
         self._active_key: tuple[str, str] | None = None
         self._sequence = 0
         self._baseline_generation = 0
@@ -291,6 +296,12 @@ class Coordinator:
                 self._rate[source] = recent
             else:
                 del self._rate[source]
+        for source, points in list(self._terminal_rate.items()):
+            recent = [point for point in points if point > now - 60]
+            if recent:
+                self._terminal_rate[source] = recent
+            else:
+                del self._terminal_rate[source]
         for key, lease in list(self._leases.items()):
             if lease.expiry <= now:
                 del self._leases[key]
@@ -440,7 +451,7 @@ class Coordinator:
 
     def _remember(self, key: tuple[str, str], event_key: tuple[str, str],
                   expiry: float, event: CueEvent) -> None:
-        if len(self._seen) >= 4096:
+        if len(self._seen) >= MAX_REPLAY_RECORDS:
             # A state-clearing cancellation may bypass admission, but cannot
             # discard another event's live replay protection to do so.
             return
@@ -489,28 +500,43 @@ class Coordinator:
         if not cancellation:
             if lease_key in self._retired_subjects:
                 return {"result": "suppressed", "reason": "lease_limit", "channels": {}}
-            if len(self._rate) >= 256 and event.source_id not in self._rate:
-                return {"result": "suppressed", "reason": "source_limit", "channels": {}}
-            if (len(self._seen) >= 4096 or
-                    (len(self._leases) >= 4096 and lease_key not in self._leases)):
+            existing = self._leases.get(lease_key)
+            if existing is not None and existing.plan["status"] in TERMINAL_STATUSES:
+                return {"result": "suppressed", "reason": ("duplicate" if event.status in TERMINAL_STATUSES
+                                                          else "lease_limit"), "channels": {}}
+            terminal_reserve = (event.status in TERMINAL_STATUSES and
+                                event.subject_id is not None and existing is not None)
+            replay_limit = (MAX_REPLAY_RECORDS if terminal_reserve else
+                            MAX_REPLAY_RECORDS - TERMINAL_REPLAY_RESERVE)
+            if (len(self._seen) >= replay_limit or
+                    (len(self._leases) >= 4096 and existing is None)):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
-            if (event.subject_id is not None and lease_key not in self._leases and
+            if (event.subject_id is not None and existing is None and
                     len(self._retired_subjects) + sum(
                         lease.plan["subject_id"] is not None for lease in self._leases.values()
                     ) >= MAX_SUBJECT_GENERATIONS):
                 return {"result": "suppressed", "reason": "capacity", "channels": {}}
-            recent = self._rate.get(event.source_id, [])
-            if self.cooldown_seconds and recent and monotonic_now - recent[-1] < self.cooldown_seconds:
-                return {"result": "suppressed", "reason": "cooldown", "channels": {}}
-            if len(recent) >= 10:
-                return {"result": "suppressed", "reason": "rate_limit", "channels": {}}
-            self._rate[event.source_id] = recent + [monotonic_now]
-            existing = self._leases.get(lease_key)
             first_seen = existing.first_seen if existing else monotonic_now
             renewals = existing.renewals + 1 if existing else 0
             deadline = min(deadline, first_seen + self.max_lease_age_s)
             if deadline <= monotonic_now:
                 return {"result": "suppressed", "reason": "lease_limit", "channels": {}}
+            if terminal_reserve:
+                recent = self._terminal_rate.get(event.source_id, [])
+                if len(recent) >= TERMINAL_RATE_PER_SOURCE:
+                    return {"result": "suppressed", "reason": "rate_limit", "channels": {}}
+                if len(self._terminal_rate) >= 4096 and event.source_id not in self._terminal_rate:
+                    return {"result": "suppressed", "reason": "source_limit", "channels": {}}
+                self._terminal_rate[event.source_id] = recent + [monotonic_now]
+            else:
+                if len(self._rate) >= 256 and event.source_id not in self._rate:
+                    return {"result": "suppressed", "reason": "source_limit", "channels": {}}
+                recent = self._rate.get(event.source_id, [])
+                if self.cooldown_seconds and recent and monotonic_now - recent[-1] < self.cooldown_seconds:
+                    return {"result": "suppressed", "reason": "cooldown", "channels": {}}
+                if len(recent) >= 10:
+                    return {"result": "suppressed", "reason": "rate_limit", "channels": {}}
+                self._rate[event.source_id] = recent + [monotonic_now]
             expiry = now + (deadline - monotonic_now)
         else:
             first_seen = monotonic_now

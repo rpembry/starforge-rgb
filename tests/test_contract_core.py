@@ -94,9 +94,11 @@ class PolicyTests(unittest.TestCase):
     def test_active_lease_severity_drop_restores_new_winner_immediately(self):
         core, sinks = self.make_core()
         low = event(event_id="low", idempotency_key="low", subject_id="low",
-                    severity="warning", cue_id="job.warning", text="Earlier warning")
+                    severity="warning", status="started", cue_id="job.warning",
+                    text="Earlier warning")
         high = event(event_id="high", idempotency_key="high", subject_id="high",
-                     severity="critical", cue_id="job.critical", text="Old critical")
+                     severity="critical", status="started", cue_id="job.critical",
+                     text="Old critical")
         core.handle(low)
         core.handle(high)
         changed = core.handle(event(event_id="high-update", idempotency_key="high-update",
@@ -111,9 +113,11 @@ class PolicyTests(unittest.TestCase):
     def test_rate_limit_and_unsupported(self):
         core = Coordinator({"rgb": FakeSink()}, clock=lambda: NOW)
         for i in range(10):
-            result = core.handle(event(event_id=f"e{i}", idempotency_key=f"k{i}"))
+            result = core.handle(event(event_id=f"e{i}", idempotency_key=f"k{i}",
+                                       subject_id=None))
             self.assertEqual(result["channels"]["text"], "unsupported")
-        self.assertEqual(core.handle(event(event_id="eleven", idempotency_key="eleven"))["reason"], "rate_limit")
+        self.assertEqual(core.handle(event(event_id="eleven", idempotency_key="eleven",
+                                           subject_id=None))["reason"], "rate_limit")
 
     def test_source_capability_is_host_registered(self):
         caps = SourceCapabilities(frozenset({"unknown"}), offers_text=False, offers_subject=False)
