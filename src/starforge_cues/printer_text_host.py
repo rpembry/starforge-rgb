@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import socket
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 
 from .printer_ingress import (BoundPrinterPublisher, PrinterIngressSettings,
                               registered_printer_host)
@@ -74,6 +74,8 @@ class PrinterForegroundSession:
         self.error: str | None = None
         self.receipts: list[dict] = []
         self._close_result: dict | None = None
+        self._stop_requested = Event()
+        self._server_exited = Event()
 
     def _deliver(self, event) -> None:
         receipt = self.publisher.publish(event)
@@ -91,14 +93,30 @@ class PrinterForegroundSession:
     def start(self) -> None:
         if self.server_thread is not None:
             raise RuntimeError("printer foreground session already started")
-        self.server_thread = Thread(target=self.host.listener.serve_forever, daemon=True)
-        self.server_thread.start()
-        self.collector_thread = Thread(target=self._collect, daemon=True)
-        self.collector_thread.start()
+        def serve():
+            try:
+                if not self._stop_requested.is_set():
+                    self.host.listener.serve_forever(poll_interval=0.05)
+            finally:
+                self._server_exited.set()
+
+        try:
+            server = Thread(target=serve, daemon=True)
+            server.start()
+            self.server_thread = server  # A failed Thread.start is never joined.
+            if not self.host.listener.service_ready.wait(timeout=2):
+                raise RuntimeError("printer listener did not become ready")
+            collector = Thread(target=self._collect, daemon=True)
+            collector.start()
+            self.collector_thread = collector
+        except Exception as exc:
+            self.close()
+            raise RuntimeError("printer foreground startup failed") from exc
 
     def close(self) -> dict:
         if self._close_result is not None:
             return dict(self._close_result)
+        self._stop_requested.set()
         stream = getattr(self.client, "stream", None)
         if stream is not None:
             try:
@@ -109,16 +127,19 @@ class PrinterForegroundSession:
                 stream.close()
             except OSError:
                 pass
-        if self.server_thread is not None:
+        if self.server_thread is not None and self.host.listener.service_ready.is_set():
             self.host.listener.shutdown()
-            self.server_thread.join(timeout=3)
         self.host.listener.close()
+        if self.server_thread is not None:
+            self.server_thread.join(timeout=3)
         if self.collector_thread is not None:
             self.collector_thread.join(timeout=3)
+        server_stopped = self.server_thread is None or not self.server_thread.is_alive()
         stopped = self.collector_thread is None or not self.collector_thread.is_alive()
-        if not stopped:
-            self.error = "collector_stop_unconfirmed"
-        self._close_result = {"listener_closed": True, "collector_stopped": stopped}
+        if not server_stopped or not stopped:
+            self.error = "foreground_stop_unconfirmed"
+        self._close_result = {"listener_closed": True, "server_stopped": server_stopped,
+                              "collector_stopped": stopped}
         return dict(self._close_result)
 
 

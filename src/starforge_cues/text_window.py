@@ -380,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"foreground cleanup: {app.cleanup}")
     if args.printer_text and (app.start_rejected or
                               (app.cleanup is not None and
-                               app.cleanup.get("collector_stopped") is False)):
+                               (app.cleanup.get("collector_stopped") is False or
+                                app.cleanup.get("server_stopped") is False))):
         return 2
     return outcome
 

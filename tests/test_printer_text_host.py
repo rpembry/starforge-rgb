@@ -11,6 +11,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from threading import Thread
 from unittest.mock import patch
 
 try:
@@ -98,6 +99,43 @@ class PrinterCardTests(unittest.TestCase):
                      pwd is not None,
                      "Linux peer credentials required")
 class ForegroundSessionTests(unittest.TestCase):
+    def test_each_worker_start_failure_cleans_up_without_joining_unstarted_thread(self):
+        for fail_at in (1, 2):
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                settings = PrinterIngressSettings(pwd.getpwuid(os.geteuid()).pw_name, root)
+                normalizer = P1ReportNormalizer(SERIAL, clock=lambda: NOW)
+                binding = printer_binding(normalizer)
+                source = next(iter(binding.source_ids))
+                core = Coordinator({"text": PrinterTextSink()}, clock=lambda: NOW,
+                                   sources={source: SourceCapabilities(binding.statuses, True, True)})
+                with patch("starforge_cues.registered_host.validate_runtime_root", return_value=root):
+                    try:
+                        session = PrinterForegroundSession(settings, normalizer, core, FakeClient())
+                    except PermissionError as exc:
+                        if exc.errno == errno.EPERM:
+                            self.skipTest("sandbox denies Unix socket bind")
+                        raise
+                original_start = Thread.start
+                calls = [0]
+
+                def selected_start(thread):
+                    calls[0] += 1
+                    if calls[0] == fail_at:
+                        raise RuntimeError("synthetic worker start failure")
+                    return original_start(thread)
+
+                with patch("starforge_cues.printer_text_host.Thread.start", selected_start):
+                    with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                        session.start()
+                self.assertEqual(calls[0], fail_at)
+                self.assertEqual(session.close(),
+                                 {"listener_closed": True, "server_stopped": True,
+                                  "collector_stopped": True})
+                self.assertFalse((root / "printer.local.sock").exists())
+                if session.server_thread is not None:
+                    self.assertFalse(session.server_thread.is_alive())
+
     def test_unstopped_collector_is_reported_as_failed_cleanup(self):
         class BlockedThread:
             def join(self, timeout):
@@ -123,8 +161,9 @@ class ForegroundSessionTests(unittest.TestCase):
                     raise
             session.collector_thread = BlockedThread()
             self.assertEqual(session.close(),
-                             {"listener_closed": True, "collector_stopped": False})
-            self.assertEqual(session.error, "collector_stop_unconfirmed")
+                             {"listener_closed": True, "server_stopped": True,
+                              "collector_stopped": False})
+            self.assertEqual(session.error, "foreground_stop_unconfirmed")
             self.assertEqual(session.close()["collector_stopped"], False)
 
     def test_fake_completion_reaches_text_and_session_reaps(self):
@@ -154,5 +193,6 @@ class ForegroundSessionTests(unittest.TestCase):
             self.assertEqual(session.receipts[0]["channels"]["text"], "accepted")
             self.assertEqual(sink.pinned_row()["text"], "Print finished.")
             result = session.close()
-            self.assertEqual(result, {"listener_closed": True, "collector_stopped": True})
+            self.assertEqual(result, {"listener_closed": True, "server_stopped": True,
+                                      "collector_stopped": True})
             self.assertFalse((root / "printer.local.sock").exists())
