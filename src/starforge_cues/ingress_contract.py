@@ -103,7 +103,7 @@ class HelloFrame:
 Frame = PublishFrame | RetractFrame | HelloFrame
 
 
-def parse_frame_json(raw: bytes) -> Frame:
+def parse_frame_json(raw: bytes, *, expected_session: str | None = None) -> Frame:
     """Decode one bounded envelope, rejecting duplicate keys at every depth."""
     if not isinstance(raw, bytes) or len(raw) > MAX_BYTES:
         raise ContractError("frame: too large")
@@ -120,6 +120,15 @@ def parse_frame_json(raw: bytes) -> Frame:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ContractError("frame: invalid JSON") from exc
+    if expected_session is not None:
+        if not isinstance(value, dict):
+            raise ContractError("frame: expected object")
+        if value.get("op") == "publish":
+            if value.get("session_epoch") != expected_session:
+                raise ContractError("session: stale or missing")
+            value = {key: item for key, item in value.items() if key != "session_epoch"}
+        elif "session_epoch" in value:
+            raise ContractError("session: invalid operation")
     return parse_frame(value)
 
 

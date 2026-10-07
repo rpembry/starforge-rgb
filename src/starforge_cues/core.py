@@ -141,6 +141,9 @@ class Coordinator:
         self._applied: dict[str, dict | None] = {}
         self._pending: dict[str, tuple[dict, int]] = {}
         self._feedback: dict[tuple[str, str], float] = {}
+        # Remains set after all admission tables expire; a registered listener
+        # must not silently reuse an older coordinator as a new session.
+        self._ever_handled = False
         self.recovery_result: dict | None = None
 
     @classmethod
@@ -431,6 +434,7 @@ class Coordinator:
 
     def handle(self, event: CueEvent) -> dict:
         with self._lock:
+            self._ever_handled = True
             return self._handle(event)
 
     def _handle(self, event: CueEvent) -> dict:
