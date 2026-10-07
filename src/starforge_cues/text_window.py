@@ -70,7 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.printer_text:
         if (args.config is None or any(value is None for value in printer_values[:5]) or
                 args.socket is not None or args.manual_audio_sink is not None or
-                args.manual_audio_gain != 0.05 or args.commissioning_override):
+                args.manual_audio_gain != 0.05 or args.commissioning_override or
+                args.exclude_source):
             parser.error("--printer-text requires protected settings and printer identity; no audio")
     elif any(value is not None for value in printer_values) or args.bambu_legacy_ca:
         parser.error("printer options require --printer-text")
@@ -125,15 +126,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.printer_peer_sha256,
                 args.printer_credential_file or default_credential_path(),
                 bambu_legacy_ca=args.bambu_legacy_ca)
-            printer_session = PrinterForegroundSession(ingress, normalizer,
-                                                       coordinator, client)
         except (OSError, ValueError, RuntimeError) as exc:
             parser.error(f"printer text setup unavailable: {type(exc).__name__}")
     else:
         from .host_config import recover_private_config
         coordinator, config_status = recover_private_config(args.config, sinks=sinks)
-    if not args.printer_text:
-        printer_session = None
     model = TextStackModel(excluded_sources=frozenset(args.exclude_source))
 
     class WindowApp(Gtk.Application):
@@ -147,8 +144,11 @@ def main(argv: list[str] | None = None) -> int:
             self.row_ids = {}
             self.closed = False
             self.cleanup = None
-            self.printer_session = printer_session
+            self.printer_session = None
             self.status_label = None
+            self.printer_ready = False
+            self.start_rejected = False
+            self.observation_stopped = False
 
         def _unlocked(self) -> bool:
             # Failure is private by default. GetActive is read-only; no lock changes.
@@ -171,10 +171,14 @@ def main(argv: list[str] | None = None) -> int:
         def _render(self) -> bool:
             coordinator.tick()
             if self.status_label is not None:
-                worker = self.printer_session.collector_thread
-                if worker is None:
+                if self.start_rejected:
+                    status = "Printer observation not started · text unavailable"
+                elif self.observation_stopped:
+                    status = "Printer observation stopped · completion unverified"
+                elif self.printer_session is None:
                     status = "Printer observation starting"
-                elif worker.is_alive():
+                elif (self.printer_session.collector_thread is not None and
+                      self.printer_session.collector_thread.is_alive()):
                     state = self.printer_session.normalizer.last_known_state or "unobserved"
                     status = f"Printer observation active · last explicit state: {state}"
                 else:
@@ -183,17 +187,28 @@ def main(argv: list[str] | None = None) -> int:
                                if self.printer_session.error else ""))
                 self.status_label.set_label(status)
             unlocked = self._unlocked()
+            banners_enabled = True
             if args.printer_text:
                 try:
-                    unlocked = unlocked and Gio.Settings.new(
+                    banners_enabled = Gio.Settings.new(
                         "org.gnome.desktop.notifications").get_boolean("show-banners")
                 except Exception:
-                    unlocked = False
-            view = model.refresh(coordinator.text_snapshot(), unlocked=unlocked,
+                    banners_enabled = False
+            snapshot = coordinator.text_snapshot()
+            if args.printer_text:
+                from .printer_text_host import text_observation_ready
+                self.printer_ready = text_observation_ready(
+                    config_status, snapshot, unlocked=unlocked,
+                    banners_enabled=banners_enabled)
+            view = model.refresh(snapshot, unlocked=unlocked and banners_enabled,
                                  elapsed=coordinator.monotonic_clock())
             if args.printer_text:
                 from .printer_text_host import with_printer_card
                 view = with_printer_card(view, sinks["text"], model.excluded_sources)
+                if (not self.printer_ready and self.printer_session is not None and
+                        not self.observation_stopped):
+                    self.cleanup = self.printer_session.close()
+                    self.observation_stopped = True
                 if view["hidden"] and self.status_label is not None:
                     self.status_label.set_label("Printer observation · details hidden by quiet or lock")
             else:
@@ -335,25 +350,38 @@ def main(argv: list[str] | None = None) -> int:
             GLib.timeout_add(500, self._render)
             self.window.present()
             if args.printer_text:
+                self._render()
+                if not self.printer_ready:
+                    self.start_rejected = True
+                    self.status_label.set_label("Printer observation not started · text unavailable")
+                    return
                 try:
+                    self.printer_session = PrinterForegroundSession(
+                        ingress, normalizer, coordinator, client)
                     self.printer_session.start()
-                except (OSError, RuntimeError):
-                    self.window.close()
-                    parser.error("printer text session unavailable")
+                except (OSError, RuntimeError, ValueError):
+                    self.start_rejected = True
+                    if self.printer_session is not None:
+                        self.cleanup = self.printer_session.close()
+                    self.status_label.set_label("Printer observation not started · setup unavailable")
 
     # Only a generic status is emitted; never print a settings path or cue body.
     print(f"text window mode: {config_status}; manual audio: "
           f"{'armed' if 'audio' in sinks else 'disabled'}")
     app = WindowApp()
     outcome = app.run([])
-    if printer_session is not None:
-        if printer_session.summary is not None:
-            print("printer session: " + json.dumps(printer_session.summary, sort_keys=True))
-        if printer_session.error is not None:
-            print(f"printer session ended: {printer_session.error}")
-        print(f"printer deliveries: {len(printer_session.receipts)}")
+    if app.printer_session is not None:
+        if app.printer_session.summary is not None:
+            print("printer session: " + json.dumps(app.printer_session.summary, sort_keys=True))
+        if app.printer_session.error is not None:
+            print(f"printer session ended: {app.printer_session.error}")
+        print(f"printer deliveries: {len(app.printer_session.receipts)}")
     if app.cleanup is not None:
         print(f"foreground cleanup: {app.cleanup}")
+    if args.printer_text and (app.start_rejected or
+                              (app.cleanup is not None and
+                               app.cleanup.get("collector_stopped") is False)):
+        return 2
     return outcome
 
 

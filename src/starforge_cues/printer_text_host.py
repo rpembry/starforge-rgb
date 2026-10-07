@@ -51,7 +51,6 @@ def with_printer_card(view: dict, sink: PrinterTextSink,
                       excluded_sources: frozenset[str]) -> dict:
     """A presentation hold; hidden by quiet, lock or source exclusion."""
     if view["hidden"]:
-        sink.dismiss()  # Do not resurface an expired card after quiet/lock.
         return view
     card = sink.pinned_row()
     if (card is None or card["source_id"] in excluded_sources or
@@ -74,6 +73,7 @@ class PrinterForegroundSession:
         self.summary: dict | None = None
         self.error: str | None = None
         self.receipts: list[dict] = []
+        self._close_result: dict | None = None
 
     def _deliver(self, event) -> None:
         receipt = self.publisher.publish(event)
@@ -97,6 +97,8 @@ class PrinterForegroundSession:
         self.collector_thread.start()
 
     def close(self) -> dict:
+        if self._close_result is not None:
+            return dict(self._close_result)
         stream = getattr(self.client, "stream", None)
         if stream is not None:
             try:
@@ -113,6 +115,15 @@ class PrinterForegroundSession:
         self.host.listener.close()
         if self.collector_thread is not None:
             self.collector_thread.join(timeout=3)
-        return {"listener_closed": True,
-                "collector_stopped": self.collector_thread is None or
-                                     not self.collector_thread.is_alive()}
+        stopped = self.collector_thread is None or not self.collector_thread.is_alive()
+        if not stopped:
+            self.error = "collector_stop_unconfirmed"
+        self._close_result = {"listener_closed": True, "collector_stopped": stopped}
+        return dict(self._close_result)
+
+
+def text_observation_ready(config_status: str, text_snapshot: dict,
+                           *, unlocked: bool, banners_enabled: bool) -> bool:
+    """Gate any printer network read on an actually displayable text channel."""
+    return (config_status == "loaded" and text_snapshot.get("quiet") is False and
+            unlocked is True and banners_enabled is True)

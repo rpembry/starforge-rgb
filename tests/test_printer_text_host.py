@@ -22,7 +22,7 @@ from starforge_cues.core import Coordinator, SourceCapabilities
 from starforge_cues.printer_ingress import PrinterIngressSettings, printer_binding
 from starforge_cues.printer_mqtt import P1ReportNormalizer
 from starforge_cues.printer_text_host import (PrinterForegroundSession, PrinterTextSink,
-                                              with_printer_card)
+                                              text_observation_ready, with_printer_card)
 from starforge_cues.text_window import main as text_window_main
 
 
@@ -50,6 +50,19 @@ class FakeClient:
 
 
 class PrinterCardTests(unittest.TestCase):
+    def test_observation_requires_loaded_visible_text_policy(self):
+        snapshot = {"quiet": False}
+        self.assertTrue(text_observation_ready("loaded", snapshot,
+                                               unlocked=True, banners_enabled=True))
+        for status, quiet, unlocked, banners in (
+                ("missing", False, True, True), ("invalid", False, True, True),
+                ("loaded", True, True, True), ("loaded", False, False, True),
+                ("loaded", False, True, False)):
+            with self.subTest(status=status, quiet=quiet, unlocked=unlocked, banners=banners):
+                self.assertFalse(text_observation_ready(status, {"quiet": quiet},
+                                                        unlocked=unlocked,
+                                                        banners_enabled=banners))
+
     def test_printer_mode_refuses_audio_before_any_gtk_or_printer_use(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             text_window_main(["--printer-text", "--config", "/unused/settings.json",
@@ -74,7 +87,10 @@ class PrinterCardTests(unittest.TestCase):
                                            frozenset({"printer.synthetic"}))["rows"], [])
         self.assertEqual(with_printer_card({**visible, "hidden": True}, sink,
                                            frozenset())["rows"], [])
-        self.assertIsNone(sink.pinned_row())
+        self.assertIsNotNone(sink.pinned_row())
+        self.assertEqual(with_printer_card(visible, sink, frozenset())["rows"][0]["text"],
+                         "Print finished.")
+        sink.dismiss()
         self.assertEqual(with_printer_card(visible, sink, frozenset())["rows"], [])
 
 
@@ -82,6 +98,35 @@ class PrinterCardTests(unittest.TestCase):
                      pwd is not None,
                      "Linux peer credentials required")
 class ForegroundSessionTests(unittest.TestCase):
+    def test_unstopped_collector_is_reported_as_failed_cleanup(self):
+        class BlockedThread:
+            def join(self, timeout):
+                self.timeout = timeout
+
+            def is_alive(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = PrinterIngressSettings(pwd.getpwuid(os.geteuid()).pw_name, root)
+            normalizer = P1ReportNormalizer(SERIAL, clock=lambda: NOW)
+            binding = printer_binding(normalizer)
+            source = next(iter(binding.source_ids))
+            core = Coordinator({"text": PrinterTextSink()}, clock=lambda: NOW,
+                               sources={source: SourceCapabilities(binding.statuses, True, True)})
+            with patch("starforge_cues.registered_host.validate_runtime_root", return_value=root):
+                try:
+                    session = PrinterForegroundSession(settings, normalizer, core, FakeClient())
+                except PermissionError as exc:
+                    if exc.errno == errno.EPERM:
+                        self.skipTest("sandbox denies Unix socket bind")
+                    raise
+            session.collector_thread = BlockedThread()
+            self.assertEqual(session.close(),
+                             {"listener_closed": True, "collector_stopped": False})
+            self.assertEqual(session.error, "collector_stop_unconfirmed")
+            self.assertEqual(session.close()["collector_stopped"], False)
+
     def test_fake_completion_reaches_text_and_session_reaps(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
