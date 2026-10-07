@@ -354,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not self.printer_ready:
                     self.start_rejected = True
                     self.status_label.set_label("Printer observation not started · text unavailable")
+                    self.window.close()
                     return
                 try:
                     self.printer_session = PrinterForegroundSession(
@@ -364,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                     if self.printer_session is not None:
                         self.cleanup = self.printer_session.close()
                     self.status_label.set_label("Printer observation not started · setup unavailable")
+                    self.window.close()
 
     # Only a generic status is emitted; never print a settings path or cue body.
     print(f"text window mode: {config_status}; manual audio: "

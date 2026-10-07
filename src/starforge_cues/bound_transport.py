@@ -4,7 +4,6 @@ import json
 import socket
 import struct
 import sys
-from threading import Event
 
 from .contract import ContractError, MAX_BYTES
 from .core import Coordinator
@@ -70,12 +69,7 @@ class BoundLocalServer(LocalServer):
         self.binding = binding
         self.expected_uid = expected_uid
         self.session_epoch = session_epoch
-        self.service_ready = Event()
         super().__init__(path, coordinator)
-
-    def service_actions(self):
-        self.service_ready.set()  # Set only from inside serve_forever's loop.
-        super().service_actions()
 
     @staticmethod
     def peer_uid(conn: socket.socket) -> int:

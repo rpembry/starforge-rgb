@@ -11,7 +11,7 @@ import socket
 import sys
 import tempfile
 import unittest
-from threading import Thread
+from threading import Event, Thread
 from unittest.mock import patch
 
 try:
@@ -99,6 +99,46 @@ class PrinterCardTests(unittest.TestCase):
                      pwd is not None,
                      "Linux peer credentials required")
 class ForegroundSessionTests(unittest.TestCase):
+    def test_stalled_server_readiness_times_out_then_late_worker_exits_on_retry_close(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = PrinterIngressSettings(pwd.getpwuid(os.geteuid()).pw_name, root)
+            normalizer = P1ReportNormalizer(SERIAL, clock=lambda: NOW)
+            binding = printer_binding(normalizer)
+            source = next(iter(binding.source_ids))
+            core = Coordinator({"text": PrinterTextSink()}, clock=lambda: NOW,
+                               sources={source: SourceCapabilities(binding.statuses, True, True)})
+            with patch("starforge_cues.registered_host.validate_runtime_root", return_value=root):
+                try:
+                    session = PrinterForegroundSession(settings, normalizer, core, FakeClient())
+                except PermissionError as exc:
+                    if exc.errno == errno.EPERM:
+                        self.skipTest("sandbox denies Unix socket bind")
+                    raise
+            entered, release = Event(), Event()
+            original_loop = session._serve_loop
+
+            def stalled_loop():
+                entered.set()
+                release.wait(timeout=3)
+                original_loop()  # Sees the stop request before it can accept.
+
+            session._serve_loop = stalled_loop
+            with patch("starforge_cues.printer_text_host.STARTUP_READY_S", 0.05), \
+                 patch("starforge_cues.printer_text_host.STOP_JOIN_S", 0.05):
+                with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                    session.start()
+            self.assertTrue(entered.is_set())
+            self.assertEqual(session._close_result["server_stopped"], False)
+            self.assertFalse((root / "printer.local.sock").exists())
+            release.set()
+            session.server_thread.join(timeout=1)
+            self.assertFalse(session.server_thread.is_alive())
+            self.assertEqual(session.close(),
+                             {"listener_closed": True, "server_stopped": True,
+                              "collector_stopped": True})
+            self.assertIsNone(session.collector_thread)
+
     def test_each_worker_start_failure_cleans_up_without_joining_unstarted_thread(self):
         for fail_at in (1, 2):
             with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as temp:

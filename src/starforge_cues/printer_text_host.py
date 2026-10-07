@@ -10,6 +10,9 @@ from .printer_ingress import (BoundPrinterPublisher, PrinterIngressSettings,
 from .printer_mqtt import P1ReportNormalizer, collect_once, diagnostic_code
 from .text_stack import TextProjectionSink
 
+STARTUP_READY_S = 2
+STOP_JOIN_S = 3
+
 
 class PrinterTextSink(TextProjectionSink):
     """Hold one proven terminal card in this foreground window until dismissal."""
@@ -75,7 +78,9 @@ class PrinterForegroundSession:
         self.receipts: list[dict] = []
         self._close_result: dict | None = None
         self._stop_requested = Event()
+        self._server_ready = Event()
         self._server_exited = Event()
+        self._socket_closed = False
 
     def _deliver(self, event) -> None:
         receipt = self.publisher.publish(event)
@@ -90,21 +95,43 @@ class PrinterForegroundSession:
         except Exception as exc:
             self.error = diagnostic_code(exc)
 
+    def _serve_loop(self) -> None:
+        """Owned bounded accept loop; stop never calls socketserver.shutdown."""
+        try:
+            if self._stop_requested.is_set():
+                return
+            self.host.listener.socket.settimeout(0.1)
+            self._server_ready.set()
+            while not self._stop_requested.is_set():
+                try:
+                    request, address = self.host.listener.get_request()
+                except socket.timeout:
+                    pass
+                except OSError:
+                    if self._stop_requested.is_set():
+                        break
+                    raise
+                else:
+                    if self._stop_requested.is_set():
+                        self.host.listener.shutdown_request(request)
+                    else:
+                        self.host.listener.process_request(request, address)
+                self.host.listener.service_actions()
+        except Exception:
+            self.error = "listener_failed"
+            self._stop_requested.set()
+        finally:
+            self._server_exited.set()
+
     def start(self) -> None:
-        if self.server_thread is not None:
-            raise RuntimeError("printer foreground session already started")
-        def serve():
-            try:
-                if not self._stop_requested.is_set():
-                    self.host.listener.serve_forever(poll_interval=0.05)
-            finally:
-                self._server_exited.set()
+        if self.server_thread is not None or self._socket_closed:
+            raise RuntimeError("printer foreground session already started or closed")
 
         try:
-            server = Thread(target=serve, daemon=True)
+            server = Thread(target=self._serve_loop, daemon=True)
             server.start()
             self.server_thread = server  # A failed Thread.start is never joined.
-            if not self.host.listener.service_ready.wait(timeout=2):
+            if not self._server_ready.wait(timeout=STARTUP_READY_S):
                 raise RuntimeError("printer listener did not become ready")
             collector = Thread(target=self._collect, daemon=True)
             collector.start()
@@ -114,26 +141,28 @@ class PrinterForegroundSession:
             raise RuntimeError("printer foreground startup failed") from exc
 
     def close(self) -> dict:
-        if self._close_result is not None:
+        if (self._close_result is not None and
+                self._close_result["server_stopped"] and
+                self._close_result["collector_stopped"]):
             return dict(self._close_result)
         self._stop_requested.set()
-        stream = getattr(self.client, "stream", None)
-        if stream is not None:
-            try:
-                stream.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                stream.close()
-            except OSError:
-                pass
-        if self.server_thread is not None and self.host.listener.service_ready.is_set():
-            self.host.listener.shutdown()
-        self.host.listener.close()
+        if not self._socket_closed:
+            stream = getattr(self.client, "stream", None)
+            if stream is not None:
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            self.host.listener.close()
+            self._socket_closed = True
         if self.server_thread is not None:
-            self.server_thread.join(timeout=3)
+            self.server_thread.join(timeout=STOP_JOIN_S)
         if self.collector_thread is not None:
-            self.collector_thread.join(timeout=3)
+            self.collector_thread.join(timeout=STOP_JOIN_S)
         server_stopped = self.server_thread is None or not self.server_thread.is_alive()
         stopped = self.collector_thread is None or not self.collector_thread.is_alive()
         if not server_stopped or not stopped:
