@@ -3,10 +3,11 @@
 from dataclasses import dataclass
 from collections import OrderedDict
 import math
+import json
 import re
 from typing import Mapping
 
-from .contract import ContractError, CueEvent, _STATUS, _SEVERITY, _identifier
+from .contract import ContractError, CueEvent, MAX_BYTES, _STATUS, _SEVERITY, _identifier
 
 
 _EPOCH = re.compile(r"[0-9a-f]{32}\Z")
@@ -100,6 +101,26 @@ class HelloFrame:
 
 
 Frame = PublishFrame | RetractFrame | HelloFrame
+
+
+def parse_frame_json(raw: bytes) -> Frame:
+    """Decode one bounded envelope, rejecting duplicate keys at every depth."""
+    if not isinstance(raw, bytes) or len(raw) > MAX_BYTES:
+        raise ContractError("frame: too large")
+
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ContractError("frame: duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ContractError("frame: invalid JSON") from exc
+    return parse_frame(value)
 
 
 def parse_frame(value: object) -> Frame:
